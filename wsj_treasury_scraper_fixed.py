@@ -1687,81 +1687,70 @@ def add_payment_columns(df: pd.DataFrame, reference_date: date) -> pd.DataFrame:
 # ============================================================
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Scrape WSJ Treasury quotes to Excel")
-    parser.add_argument("--url", default=DEFAULT_URL, help="WSJ Treasury page URL")
-    parser.add_argument("--output", default="wsj_treasuries.xlsx", help="Output Excel file path")
+    parser = argparse.ArgumentParser(description="Scrape WSJ Treasury or Barchart Futures quotes to Excel")
+    parser.add_argument(
+        "--source",
+        choices=["wsj", "barchart"],
+        default="wsj",
+        help="Data source: 'wsj' (default) or 'barchart'",
+    )
+    parser.add_argument("--url", default=None, help="Override the default URL for the chosen source")
+    parser.add_argument("--output", default=None, help="Output Excel file path (default depends on source)")
     parser.add_argument(
         "--reference-date",
         default=None,
-        help="Override the article/page date with YYYY-MM-DD if the page does not expose one",
+        help="(WSJ only) Override the article date with YYYY-MM-DD",
     )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
-    reference_date = get_reference_date(args.url, args.reference_date)
-    df = scrape_treasuries(args.url)
+    # ── Barchart path ──────────────────────────────────────────────────────────
+    if args.source == "barchart":
+        url = args.url or BARCHART_URL
+        output_path = Path(args.output or "barchart_futures.xlsx")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        print(f"Scraping Barchart futures from {url} ...")
+        df = scrape_barchart_futures(url, log=lambda m: print(m))
+
+        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="Barchart Futures")
+
+        print(f"Saved {len(df)} rows to {output_path.resolve()}")
+        return 0
+
+    # ── WSJ path ───────────────────────────────────────────────────────────────
+    url = args.url or DEFAULT_URL
+    output_path = Path(args.output or "wsj_treasuries.xlsx")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    reference_date = get_reference_date(url, args.reference_date)
+    df = scrape_treasuries(url)
     df = add_payment_columns(df, reference_date)
 
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    
     formula_rows = 14
     sheet_name = "Treasuries"
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-
-        # Move dataframe down
-        df.to_excel(
-            writer,
-            index=False,
-            sheet_name=sheet_name,
-            startrow=formula_rows,
-        )
-
+        df.to_excel(writer, index=False, sheet_name=sheet_name, startrow=formula_rows)
         ws = writer.book[sheet_name]
+        ws["A1"]  = "Treasury Formulas"
+        ws["A2"]  = "Coupon Payment";    ws["B2"]  = "Coupon/2*1000"
+        ws["A3"]  = "PV0";               ws["B3"]  = "PV(Ask Yield/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
+        ws["A4"]  = "PV1";               ws["B4"]  = "PV((Ask Yield+1%)/2, Number of Payments Until Maturity-2, Coupon Payment, 1000)"
+        ws["A5"]  = "P0";                ws["B5"]  = "PV0 * (1+Asked Yield/2)^(Days Since Last Payment/182)"
+        ws["A6"]  = "P1";                ws["B6"]  = "PV1 * (1+(Asked Yield+1%)/2)^(Days Since Last Payment/182)"
+        ws["A7"]  = "Simulated Return";  ws["B7"]  = "(P1- P0 + Coupon*10)/P0"
+        ws["A8"]  = "MACAULAY DURATION"; ws["B8"]  = "DURATION(Current Date, Maturity Date, Coupon Rate, Ask Yield, 2)"
+        ws["A9"]  = "MODIFIED DURATION"; ws["B9"]  = "MDURATION(Current Date, Maturity Date, Coupon Rate, Ask Yield, 2)"
+        ws["A10"] = "PVUP";              ws["B10"] = "PV(Ask Yield+1%/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
+        ws["A11"] = "PVDN";              ws["B11"] = "PV(Ask Yield-1%/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
+        ws["A12"] = "PUP";               ws["B12"] = "PVUP * (1+(Asked Yield+1%)/2)^(Days Since Last Payment/182)"
+        ws["A13"] = "PDN";               ws["B13"] = "PVDN * (1+(Asked Yield-1%)/2)^(Days Since Last Payment/182)"
+        ws["A14"] = "EFDURATION";        ws["B14"] = "(PDN- PUP)/(2*.01*P0)"
 
-        # ------------------------------------
-        # TOP FORMULA / SUMMARY SECTION
-        # ------------------------------------
-
-        ws["A1"] = "Treasury Formulas"
-
-        # Data starts here
-        first_data_row = formula_rows + 2
-        last_data_row = formula_rows + 1 + len(df)
-
-        # Example formulas
-        ws["A2"] = "Coupon Payment"
-        ws["B2"] = "Coupon/2*1000"
-
-        ws["A3"] = "PV0"
-        ws["B3"] = "PV(Ask Yield/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
-        ws["A4"] = "PV1"
-        ws["B4"] = "PV((Ask Yield+1%)/2, Number of Payments Until Maturity-2, Coupon Payment, 1000)"
-        ws["A5"] = "P0"
-        ws["B5"] = "PV0 * (1+Asked Yield/2)^(Days Since Last Payment/182)"
-        ws["A6"] = "P1"
-        ws["B6"] = "PV1 * (1+(Asked Yield+1%)/2)^(Days Since Last Payment/182)"
-        ws["A7"] = "Simulated Return"
-        ws["B7"] = "(P1- P0 + Coupon*10)/P0"
-        ws["A8"] = "MACAULAY DURATION"
-        ws["B8"] = "DURATION(Current Date, Maturity Date, Coupon Rate, Ask Yield, 2)"
-        ws["A9"] = "MODIFIED DURATION"
-        ws["B9"] = "MDURATION(Current Date, Maturity Date, Coupon Rate, Ask Yield, 2)"
-        ws["A10"] = "PVUP"
-        ws["B10"] = "PV(Ask Yield+1%/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
-        ws["A11"] = "PVDN"
-        ws["B11"] = "PV(Ask Yield-1%/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
-        ws["A12"] = "PUP"
-        ws["B12"] = "PVUP * (1+(Asked Yield+1%)/2)^(Days Since Last Payment/182)"
-        ws["A13"] = "PDN"
-        ws["B13"] = "PVDN * (1+(Asked Yield-1%)/2)^(Days Since Last Payment/182)"
-        ws["A14"] = "EFDURATION"
-        ws["B14"] = "(PDN- PUP)/(2*.01*P0)"
-        
-        
-        print(f"Saved {len(df)} rows to {output_path.resolve()}")
-        print(f"Reference date used: {reference_date.isoformat()}")
-        return 0
+    print(f"Saved {len(df)} rows to {output_path.resolve()}")
+    print(f"Reference date used: {reference_date.isoformat()}")
+    return 0
 
 
 if __name__ == "__main__":
