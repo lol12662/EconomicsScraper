@@ -331,13 +331,69 @@ class TreasuryApp(Tk):
         self._log(f"Preview updated ({min(len(df), 100)} of {len(df)} rows shown).")
 
 
+def _write_crash_log(text: str) -> None:
+    """Write a crash log to the desktop so it's visible even when the app quits silently."""
+    try:
+        desktop = Path.home() / "Desktop" / "WSJ_Treasury_CRASH.txt"
+        desktop.write_text(text, encoding="utf-8")
+    except Exception:
+        pass
+    # Also try next to the executable
+    try:
+        log_path = HERE / "WSJ_Treasury_CRASH.txt"
+        log_path.write_text(text, encoding="utf-8")
+    except Exception:
+        pass
+
+
 def main() -> int:
-    if scraper is None:
-        print(f"Could not import wsj_treasury_scraper: {_import_error}", file=sys.stderr)
+    import traceback as _tb
+
+    # Log startup info immediately so we know the app launched
+    startup_info = (
+        f"Python: {sys.version}\n"
+        f"Executable: {sys.executable}\n"
+        f"Frozen: {getattr(sys, 'frozen', False)}\n"
+        f"HERE: {HERE}\n"
+        f"sys.path: {sys.path}\n"
+        f"scraper loaded: {scraper is not None}\n"
+        f"import error: {_import_error}\n"
+    )
+
+    try:
+        if scraper is None:
+            msg = f"Could not import wsj_treasury_scraper_fixed:\n{_import_error}\n\n{startup_info}"
+            _write_crash_log(msg)
+            # Try to show a Tkinter error dialog before giving up
+            try:
+                import tkinter as _tk
+                _root = _tk.Tk()
+                _root.withdraw()
+                from tkinter import messagebox as _mb
+                _mb.showerror("Import Error",
+                    f"Could not load scraper module:\n{_import_error}\n\nSee WSJ_Treasury_CRASH.txt on your Desktop.")
+                _root.destroy()
+            except Exception:
+                pass
+            return 1
+
+        app = TreasuryApp()
+        app.mainloop()
+        return 0
+
+    except Exception as exc:
+        crash = f"CRASH:\n{_tb.format_exc()}\n\nStartup info:\n{startup_info}"
+        _write_crash_log(crash)
+        try:
+            import tkinter as _tk
+            _root = _tk.Tk()
+            _root.withdraw()
+            from tkinter import messagebox as _mb
+            _mb.showerror("Crash", f"{exc}\n\nDetails saved to WSJ_Treasury_CRASH.txt on your Desktop.")
+            _root.destroy()
+        except Exception:
+            pass
         return 1
-    app = TreasuryApp()
-    app.mainloop()
-    return 0
 
 
 if __name__ == "__main__":
