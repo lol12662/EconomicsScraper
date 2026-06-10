@@ -14,9 +14,20 @@ from tkinter import (
 )
 from tkinter import ttk
 
-HERE = Path(__file__).resolve().parent
-if str(HERE) not in sys.path:
-    sys.path.insert(0, str(HERE))
+# Resolve the correct base directory whether running frozen or as a .py file
+if getattr(sys, "frozen", False):
+    # PyInstaller bundle: _MEIPASS is the temp extraction dir (onefile)
+    # or the app dir (onedir). We want the folder beside the actual executable.
+    HERE = Path(sys.executable).resolve().parent
+    _bundle = Path(getattr(sys, "_MEIPASS", HERE))
+    # Add both so the scraper module can be found either way
+    for _p in (str(HERE), str(_bundle)):
+        if _p not in sys.path:
+            sys.path.insert(0, _p)
+else:
+    HERE = Path(__file__).resolve().parent
+    if str(HERE) not in sys.path:
+        sys.path.insert(0, str(HERE))
 
 try:
     import wsj_treasury_scraper_fixed as scraper
