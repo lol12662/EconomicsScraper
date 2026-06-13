@@ -87,7 +87,7 @@ python3 wsj_treasury_scraper_fixed.py --source wsj --reference-date 2026-06-01
 
 ## Building a Standalone App
 
-### macOS
+### macOS(Work In Progress)
 
 Place all files in the same folder, open Terminal, navigate to that folder, and run:
 
