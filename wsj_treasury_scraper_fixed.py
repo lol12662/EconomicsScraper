@@ -1424,6 +1424,93 @@ def _barchart_via_playwright_intercept(url: str, log: Any = None) -> Optional[pd
     return None
 
 
+def _convert_treasury_price(val: str) -> str:
+    """
+    Convert a Barchart treasury price string to a decimal.
+
+    Format rules:
+      XX-YY      → XX + YY/32
+      XX-YYZ     → XX + YY/32 + Z/8/32   (Z is a single digit: 2=¼, 4=½, 6=¾)
+      XX-YY+     → XX + YY/32 + 0.5/32   ('+' means half a 32nd)
+      Anything not matching is returned unchanged.
+
+    Examples:
+      "97-08"  → 97.25       (8/32 = 0.25)
+      "111-22" → 111.6875    (22/32 = 0.6875)
+      "109-162"→ 109.515625  (16/32 + 2/8/32)
+      "97-08+" → 97.265625   (8/32 + 0.5/32)
+    """
+    if not isinstance(val, str):
+        return str(val)
+    s = val.strip()
+
+    # Handle leading +/- sign for change column
+    sign = 1
+    if s.startswith(("+", "-")):
+        sign = -1 if s[0] == "-" else 1
+        s = s[1:].strip()
+
+    # Match: whole-YY or whole-YYZ or whole-YY+
+    m = re.match(r"^(\d+)-(\d{2,3})(\+?)$", s)
+    if not m:
+        return val  # not a treasury price format — leave as-is
+
+    whole   = int(m.group(1))
+    frac_s  = m.group(2)
+    plus    = m.group(3) == "+"
+
+    if len(frac_s) == 2:
+        # XX-YY
+        thirty_seconds = int(frac_s)
+        extra = 0.0
+    else:
+        # XX-YYZ  where Z is the third digit (eighths of a 32nd)
+        thirty_seconds = int(frac_s[:2])
+        extra = int(frac_s[2]) / 8.0
+
+    decimal = whole + (thirty_seconds + extra + (0.5 if plus else 0.0)) / 32.0
+    result  = f"{sign * decimal:.6f}".rstrip("0").rstrip(".")
+    return result
+
+
+def _postprocess_barchart(df: pd.DataFrame, log: Any = None) -> pd.DataFrame:
+    """
+    Clean up the raw Barchart dataframe:
+      1. Drop exact duplicate rows (same Symbol + Latest).
+      2. Drop rows that are just repeated header/section rows.
+      3. Convert Latest and Change from treasury fractional notation to decimals.
+    """
+    def _dbg(m: str) -> None:
+        if log: log(m)
+
+    before = len(df)
+
+    # 1. Drop rows where Symbol is blank or looks like a header repeat
+    if "Symbol" in df.columns:
+        df = df[df["Symbol"].str.strip().str.len() > 0]
+        df = df[~df["Symbol"].str.lower().isin({"symbol", "contract", "name"})]
+
+    # 2. Drop exact duplicates on Symbol (keep first occurrence)
+    if "Symbol" in df.columns:
+        df = df.drop_duplicates(subset=["Symbol"], keep="first")
+
+    after_dedup = len(df)
+    _dbg(f"  Deduplication: {before} → {after_dedup} rows")
+
+    # 3. Convert fractional treasury prices in Latest and Change
+    for col in ("Latest", "Change"):
+        if col not in df.columns:
+            continue
+        converted = df[col].apply(_convert_treasury_price)
+        changed = (converted != df[col]).sum()
+        if changed:
+            _dbg(f"  Converted {changed} values in '{col}' from fractional to decimal")
+        df[col] = converted
+
+    df = df.reset_index(drop=True)
+    return df
+
+
 def scrape_barchart_futures(url: str = BARCHART_URL, log: Any = None) -> pd.DataFrame:
     """
     Scrape the Barchart financials futures page for:
@@ -1443,17 +1530,17 @@ def scrape_barchart_futures(url: str = BARCHART_URL, log: Any = None) -> pd.Data
     _dbg("Strategy 1: Proxima internal API…")
     df = _barchart_via_proxima(session, log=log)
     if df is not None and not df.empty:
-        return df
+        return _postprocess_barchart(df, log=log)
 
     _dbg("Strategy 2: Legacy marketdata API…")
     df = _barchart_via_marketdata(session, log=log)
     if df is not None and not df.empty:
-        return df
+        return _postprocess_barchart(df, log=log)
 
     _dbg("Strategy 3: Playwright browser with network interception…")
     df = _barchart_via_playwright_intercept(url, log=log)
     if df is not None and not df.empty:
-        return df
+        return _postprocess_barchart(df, log=log)
 
     raise RuntimeError(
         "Could not extract futures data from Barchart.\n\n"
