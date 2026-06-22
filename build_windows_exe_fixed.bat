@@ -1,19 +1,46 @@
 @echo off
 setlocal
+cd /d "%~dp0"
 
-REM Build the EXE with Playwright support.
-REM Run this on Windows after installing Python.
-
+echo Installing dependencies...
 python -m pip install --upgrade pip
-python -m pip install pyinstaller pandas openpyxl requests playwright
-python -m playwright install chromium
-
-pyinstaller --noconfirm --onefile --windowed --name WSJ_Treasury_GUI ^
-  --add-data "%LOCALAPPDATA%\ms-playwright;ms-playwright" ^
-  --hidden-import playwright.sync_api ^
-  --add-data "wsj_treasury_scraper_fixed.py;." ^
-  wsj_treasury_gui_fixed.py
+python -m pip install pyinstaller pandas openpyxl requests playwright matplotlib yfinance fredapi statsmodels
 
 echo.
-echo Build complete. The EXE is in dist\WSJ_Treasury_GUI.exe
+echo Installing Chromium browser...
+python -m playwright install chromium
+
+echo.
+echo Cleaning previous build...
+if exist "build\WSJ_Treasury_GUI" rmdir /s /q "build\WSJ_Treasury_GUI"
+if exist "dist\WSJ_Treasury_GUI"  rmdir /s /q "dist\WSJ_Treasury_GUI"
+
+echo.
+echo Building EXE...
+python -m PyInstaller --noconfirm WSJ_Treasury_GUI.spec
+
+echo.
+if exist "dist\WSJ_Treasury_GUI\WSJ_Treasury_GUI.exe" (
+    echo ================================================
+    echo   Build complete!
+    echo.
+    echo   Your app folder:
+    echo   dist\WSJ_Treasury_GUI\
+    echo.
+    echo   Send the entire dist\WSJ_Treasury_GUI\ folder
+    echo   to anyone - they just double-click the .exe
+    echo   No Python needed on their machine.
+    echo.
+    echo   NOTE: First Barchart scrape on a new machine
+    echo   will auto-install Chromium ^(~150 MB, once only^).
+    echo ================================================
+    explorer "dist\WSJ_Treasury_GUI"
+) else (
+    echo ================================================
+    echo   ERROR: EXE not found at expected location:
+    echo   dist\WSJ_Treasury_GUI\WSJ_Treasury_GUI.exe
+    echo.
+    echo   Check the output above for errors.
+    echo ================================================
+)
 pause

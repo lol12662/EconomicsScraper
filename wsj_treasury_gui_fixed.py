@@ -44,11 +44,48 @@ try:
 except ImportError:
     _MPL = False
 
+def _ensure_playwright_chromium(log_fn=None) -> bool:
+    """
+    If running as a frozen app and Playwright's Chromium isn't installed yet,
+    install it automatically into the user's home directory.
+    Returns True if Chromium is available, False if install failed.
+    """
+    import subprocess
+    try:
+        from playwright.sync_api import sync_playwright
+        # Quick check: can we actually find a browser?
+        with sync_playwright() as p:
+            p.chromium.executable_path  # raises if not found
+        return True
+    except Exception:
+        pass
+
+    if log_fn:
+        log_fn("First launch: installing Chromium browser (~150 MB)…")
+        log_fn("This only happens once. Please wait…")
+
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            capture_output=True, text=True, timeout=300,
+        )
+        if result.returncode == 0:
+            if log_fn: log_fn("✓ Chromium installed successfully.")
+            return True
+        else:
+            if log_fn: log_fn(f"Chromium install failed:\n{result.stderr}")
+            return False
+    except Exception as e:
+        if log_fn: log_fn(f"Chromium install error: {e}")
+        return False
+
+
 WSJ_URL      = "https://www.wsj.com/market-data/bonds/treasuries#treasuryB"
 BARCHART_URL = "https://www.barchart.com/futures/financials?viewName=main"
 SOURCE_WSJ      = "WSJ Treasuries"
 SOURCE_BARCHART = "Barchart Futures"
-SOURCES = [SOURCE_WSJ, SOURCE_BARCHART]
+SOURCE_MARKET   = "Market Data (Yahoo/FRED)"
+SOURCES = [SOURCE_WSJ, SOURCE_BARCHART, SOURCE_MARKET]
 
 # Columns to skip as chart series (used as X axis or non-numeric)
 _SKIP_COLS = {"Maturity", "Article Date", "Last Payment Date", "Symbol",
@@ -71,7 +108,20 @@ class TreasuryApp(Tk):
 
         self._worker: threading.Thread | None = None
         self._current_df = None
-        self._chart_vars: dict[str, BooleanVar] = {}   # column → checkbox var
+        self._current_bc_df = None
+        self._current_mkt_df = None
+        self._chart_vars: dict[str, BooleanVar] = {}      # WSJ column → checkbox var
+        self._chart_bc_vars: dict[str, BooleanVar] = {}   # Barchart series → checkbox var
+        self._chart_mkt_vars: dict[str, BooleanVar] = {}  # Market data series → checkbox var
+
+        # Persist API key across sessions via a simple file
+        self._api_key_file = HERE / ".fred_api_key"
+        self._saved_api_key = ""
+        try:
+            if self._api_key_file.exists():
+                self._saved_api_key = self._api_key_file.read_text().strip()
+        except Exception:
+            pass
 
         self._build_ui()
         if _import_error is not None:
@@ -95,29 +145,76 @@ class TreasuryApp(Tk):
             ttk.Radiobutton(src_frame, text=src, variable=self.source_var,
                             value=src, command=self._on_source_changed).pack(side=LEFT, padx=(0, 16))
 
-        Label(top, text="URL").grid(row=1, column=0, sticky="w", pady=(0, 4))
-        Entry(top, textvariable=self.url_var).grid(row=1, column=1, sticky="we", padx=(8, 8), pady=(0, 4))
+        # ── WSJ / Barchart fields ──────────────────────────────────────────────
+        self._url_label = Label(top, text="URL")
+        self._url_label.grid(row=1, column=0, sticky="w", pady=(0, 4))
+        self._url_entry = Entry(top, textvariable=self.url_var)
+        self._url_entry.grid(row=1, column=1, sticky="we", padx=(8, 8), pady=(0, 4))
 
-        Label(top, text="Output file").grid(row=2, column=0, sticky="w", pady=(0, 4))
-        out_row = Frame(top)
-        out_row.grid(row=2, column=1, sticky="we", padx=(8, 8), pady=(0, 4))
-        Entry(out_row, textvariable=self.output_var).pack(side=LEFT, fill=X, expand=True)
-        Button(out_row, text="Browse…", command=self._browse_output).pack(side=RIGHT, padx=(8, 0))
+        self._out_label = Label(top, text="Output file")
+        self._out_label.grid(row=2, column=0, sticky="w", pady=(0, 4))
+        self._out_row = Frame(top)
+        self._out_row.grid(row=2, column=1, sticky="we", padx=(8, 8), pady=(0, 4))
+        Entry(self._out_row, textvariable=self.output_var).pack(side=LEFT, fill=X, expand=True)
+        Button(self._out_row, text="Browse…", command=self._browse_output).pack(side=RIGHT, padx=(8, 0))
 
         self._ref_label = Label(top, text="Reference date (YYYY-MM-DD)")
         self._ref_label.grid(row=3, column=0, sticky="w", pady=(0, 4))
         self._ref_entry = Entry(top, textvariable=self.reference_var)
         self._ref_entry.grid(row=3, column=1, sticky="we", padx=(8, 8), pady=(0, 4))
 
+        # ── Market Data fields (hidden by default) ─────────────────────────────
+        self._mkt_fred_label = Label(top, text="FRED API Key")
+        self._mkt_fred_label.grid(row=1, column=0, sticky="w", pady=(0, 4))
+        self._mkt_fred_row = Frame(top)
+        self._mkt_fred_row.grid(row=1, column=1, sticky="we", padx=(8, 8), pady=(0, 4))
+        self._fred_key_var = StringVar(value=self._saved_api_key)
+        Entry(self._mkt_fred_row, textvariable=self._fred_key_var, show="*").pack(side=LEFT, fill=X, expand=True)
+        Button(self._mkt_fred_row, text="Save", command=self._save_api_key, width=6).pack(side=LEFT, padx=(4, 0))
+        Label(self._mkt_fred_row, text="(fred.stlouisfed.org)", font=("", 7),
+              foreground="gray").pack(side=LEFT, padx=(6, 0))
+
+        self._mkt_tickers_label = Label(top, text="Yahoo Tickers")
+        self._mkt_tickers_label.grid(row=2, column=0, sticky="w", pady=(0, 4))
+        self._tickers_var = StringVar(value="HYG, SPY, ^TNX")
+        self._mkt_tickers_entry = Entry(top, textvariable=self._tickers_var)
+        self._mkt_tickers_entry.grid(row=2, column=1, sticky="we", padx=(8, 8), pady=(0, 4))
+
+        self._mkt_fred_series_label = Label(top, text="FRED Series")
+        self._mkt_fred_series_label.grid(row=3, column=0, sticky="w", pady=(0, 4))
+        self._fred_series_var = StringVar(value="DGS1, DTB3, DGS10, DBAA")
+        self._mkt_fred_series_entry = Entry(top, textvariable=self._fred_series_var)
+        self._mkt_fred_series_entry.grid(row=3, column=1, sticky="we", padx=(8, 8), pady=(0, 4))
+
+        self._mkt_dates_label = Label(top, text="Start / End date")
+        self._mkt_dates_label.grid(row=4, column=0, sticky="w", pady=(0, 4))
+        self._mkt_dates_row = Frame(top)
+        self._mkt_dates_row.grid(row=4, column=1, sticky="we", padx=(8, 8), pady=(0, 4))
+        self._mkt_start_var = StringVar(value="2025-01-02")
+        self._mkt_end_var   = StringVar(value="2025-06-30")
+        Entry(self._mkt_dates_row, textvariable=self._mkt_start_var, width=14).pack(side=LEFT)
+        Label(self._mkt_dates_row, text=" → ").pack(side=LEFT)
+        Entry(self._mkt_dates_row, textvariable=self._mkt_end_var, width=14).pack(side=LEFT)
+
+        self._mkt_csv_label = Label(top, text="Output CSV")
+        self._mkt_csv_label.grid(row=5, column=0, sticky="w", pady=(0, 4))
+        self._mkt_csv_row = Frame(top)
+        self._mkt_csv_row.grid(row=5, column=1, sticky="we", padx=(8, 8), pady=(0, 4))
+        self._mkt_output_var = StringVar(value=str(HERE / "HighYieldData.csv"))
+        Entry(self._mkt_csv_row, textvariable=self._mkt_output_var).pack(side=LEFT, fill=X, expand=True)
+        Button(self._mkt_csv_row, text="Browse…", command=self._browse_mkt_output).pack(side=RIGHT, padx=(4, 0))
+
+        # ── Action buttons ─────────────────────────────────────────────────────
         btn_row = Frame(top)
-        btn_row.grid(row=4, column=1, sticky="w", padx=(8, 8), pady=(6, 2))
-        Button(btn_row, text="Run scrape",         command=self._run_clicked,        width=16).pack(side=LEFT)
+        btn_row.grid(row=6, column=1, sticky="w", padx=(8, 8), pady=(6, 2))
+        self._run_btn = Button(btn_row, text="Run scrape", command=self._run_clicked, width=16)
+        self._run_btn.pack(side=LEFT)
         Button(btn_row, text="Open output folder", command=self._open_output_folder, width=18).pack(side=LEFT, padx=(8, 0))
 
         log_btn_row = Frame(top)
-        log_btn_row.grid(row=5, column=1, sticky="w", padx=(8, 8), pady=(2, 8))
-        Button(log_btn_row, text="Save log…", command=self._save_log,  width=14).pack(side=LEFT)
-        Button(log_btn_row, text="Clear log", command=self._clear_log, width=12).pack(side=LEFT, padx=(8, 0))
+        log_btn_row.grid(row=7, column=1, sticky="w", padx=(8, 8), pady=(2, 8))
+        Button(log_btn_row, text="Save log…", command=self._save_log, width=14).pack(side=LEFT)
+        Button(log_btn_row, text="Clear log",  command=self._clear_log, width=12).pack(side=LEFT, padx=(8, 0))
 
         top.columnconfigure(1, weight=1)
 
@@ -145,17 +242,24 @@ class TreasuryApp(Tk):
         xscroll.config(command=self.tree.xview)
         self.tree.pack(fill=BOTH, expand=True)
 
-        # ── Tab 2: Chart ───────────────────────────────────────────────────────
+        # ── Tab 2: Chart (WSJ) ─────────────────────────────────────────────────
         chart_tab = Frame(self.notebook)
         self.notebook.add(chart_tab, text="Chart (WSJ)")
 
         if _MPL:
-            # Left: checkboxes to pick series
-            ctrl_frame = Frame(chart_tab, width=180)
+            # Left panel: series checkboxes + controls
+            ctrl_frame = Frame(chart_tab, width=190)
             ctrl_frame.pack(side=LEFT, fill=Y, padx=(8, 4), pady=8)
             ctrl_frame.pack_propagate(False)
 
-            Label(ctrl_frame, text="Series", font=("", 10, "bold")).pack(anchor=W, pady=(0, 4))
+            Label(ctrl_frame, text="Series", font=("", 10, "bold")).pack(anchor=W, pady=(0, 2))
+
+            # Select All / Deselect All buttons
+            sel_row = Frame(ctrl_frame)
+            sel_row.pack(anchor=W, fill=X, pady=(0, 6))
+            Button(sel_row, text="Select All",   command=self._wsj_select_all,   width=10).pack(side=LEFT)
+            Button(sel_row, text="Deselect All", command=self._wsj_deselect_all, width=10).pack(side=LEFT, padx=(4, 0))
+
             self._checkbox_frame = Frame(ctrl_frame)
             self._checkbox_frame.pack(fill=X, anchor=W)
 
@@ -187,6 +291,94 @@ class TreasuryApp(Tk):
                   text="matplotlib is not installed.\nRun:  pip install matplotlib",
                   justify="center", pady=40).pack(expand=True)
 
+        # ── Tab 3: Chart (Barchart) ─────────────────────────────────────────────
+        bc_chart_tab = Frame(self.notebook)
+        self.notebook.add(bc_chart_tab, text="Chart (Barchart)")
+
+        if _MPL:
+            # Left panel
+            bc_ctrl = Frame(bc_chart_tab, width=190)
+            bc_ctrl.pack(side=LEFT, fill=Y, padx=(8, 4), pady=8)
+            bc_ctrl.pack_propagate(False)
+
+            Label(bc_ctrl, text="Series", font=("", 10, "bold")).pack(anchor=W, pady=(0, 2))
+
+            bc_sel_row = Frame(bc_ctrl)
+            bc_sel_row.pack(anchor=W, fill=X, pady=(0, 6))
+            Button(bc_sel_row, text="Select All",   command=self._bc_select_all,   width=10).pack(side=LEFT)
+            Button(bc_sel_row, text="Deselect All", command=self._bc_deselect_all, width=10).pack(side=LEFT, padx=(4, 0))
+
+            self._bc_checkbox_frame = Frame(bc_ctrl)
+            self._bc_checkbox_frame.pack(fill=X, anchor=W)
+
+            Button(bc_ctrl, text="Update chart", command=self._draw_bc_chart,
+                   width=16).pack(anchor=W, pady=(12, 0))
+
+            # Right: matplotlib canvas
+            bc_canvas_frame = Frame(bc_chart_tab)
+            bc_canvas_frame.pack(side=LEFT, fill=BOTH, expand=True, pady=8, padx=(0, 8))
+
+            self._bc_fig = Figure(figsize=(7, 4), dpi=96, tight_layout=True)
+            self._bc_ax  = self._bc_fig.add_subplot(111)
+            self._bc_canvas = FigureCanvasTkAgg(self._bc_fig, master=bc_canvas_frame)
+            self._bc_canvas.get_tk_widget().pack(fill=BOTH, expand=True)
+            NavigationToolbar2Tk(self._bc_canvas, bc_canvas_frame).pack(fill=X)
+
+            self._bc_ax.set_title("Run a Barchart scrape to populate the chart")
+            self._bc_canvas.draw()
+        else:
+            Label(bc_chart_tab,
+                  text="matplotlib is not installed.\nRun:  pip install matplotlib",
+                  justify="center", pady=40).pack(expand=True)
+
+        # ── Tab 4: Chart (Market Data) ─────────────────────────────────────────
+        mkt_chart_tab = Frame(self.notebook)
+        self.notebook.add(mkt_chart_tab, text="Chart (Market Data)")
+
+        if _MPL:
+            mkt_chart_top = Frame(mkt_chart_tab)
+            mkt_chart_top.pack(fill=X, padx=8, pady=(6, 0))
+            Label(mkt_chart_top, text="Series  ").pack(side=LEFT)
+            Button(mkt_chart_top, text="Select All",   command=self._mkt_select_all,   width=10).pack(side=LEFT)
+            Button(mkt_chart_top, text="Deselect All", command=self._mkt_deselect_all, width=10).pack(side=LEFT, padx=(4, 0))
+            self._mkt_checkbox_frame = Frame(mkt_chart_top)
+            self._mkt_checkbox_frame.pack(side=LEFT, padx=(12, 0))
+
+            self._mkt_fig = Figure(figsize=(7, 4), dpi=96, tight_layout=True)
+            self._mkt_ax  = self._mkt_fig.add_subplot(111)
+            self._mkt_canvas = FigureCanvasTkAgg(self._mkt_fig, master=mkt_chart_tab)
+            self._mkt_canvas.get_tk_widget().pack(fill=BOTH, expand=True, pady=(6, 0))
+            NavigationToolbar2Tk(self._mkt_canvas, mkt_chart_tab).pack(fill=X)
+            self._mkt_ax.set_title("Select Market Data source and click Fetch Data")
+            self._mkt_canvas.draw()
+        else:
+            Label(mkt_chart_tab, text="Install matplotlib to see chart.\npip install matplotlib",
+                  justify="center").pack(expand=True)
+
+        # ── Tab 5: Regression (Bond Returns) ────────────────────────────────────
+        regress_tab = Frame(self.notebook)
+        self.notebook.add(regress_tab, text="Regression")
+
+        regress_top = Frame(regress_tab)
+        regress_top.pack(fill=X, padx=8, pady=(8, 4))
+        Label(regress_top, text="Runs OLS regressions on the fetched Market Data:",
+              font=("", 9)).pack(side=LEFT)
+        Button(regress_top, text="Run Regression", command=self._run_regression_clicked,
+               width=16).pack(side=RIGHT)
+
+        Label(regress_tab,
+              text="Model 1:  RHYG ~ RSP        Model 2:  RHYG ~ RSP + CHI",
+              font=("", 9, "italic"), foreground="gray").pack(anchor=W, padx=8, pady=(0, 6))
+
+        regress_scroll = ttk.Scrollbar(regress_tab, orient="vertical")
+        regress_scroll.pack(side=RIGHT, fill=Y)
+        self._regress_text = Text(regress_tab, wrap="none", font=("Courier New", 9),
+                                  yscrollcommand=regress_scroll.set)
+        regress_scroll.config(command=self._regress_text.yview)
+        self._regress_text.pack(fill=BOTH, expand=True, padx=(8, 0), pady=(0, 8))
+        self._regress_text.insert(END, "Fetch Market Data first, then click 'Run Regression'.\n")
+        self._regress_text.config(state="disabled")
+
         # ── Log panel ──────────────────────────────────────────────────────────
         log_box = Frame(mid, width=380)
         log_box.pack(side=RIGHT, fill=Y, padx=(8, 0))
@@ -217,16 +409,35 @@ class TreasuryApp(Tk):
 
     def _on_source_changed(self) -> None:
         src = self.source_var.get()
-        if src == SOURCE_WSJ:
-            self.url_var.set(WSJ_URL)
-            self.output_var.set(str(HERE / "wsj_treasuries.xlsx"))
-            self._ref_label.grid()
-            self._ref_entry.grid()
-        else:
-            self.url_var.set(BARCHART_URL)
-            self.output_var.set(str(HERE / "barchart_futures.xlsx"))
+        wsj_bc = [self._url_label, self._url_entry, self._out_label, self._out_row]
+        mkt = [
+            self._mkt_fred_label, self._mkt_fred_row,
+            self._mkt_tickers_label, self._mkt_tickers_entry,
+            self._mkt_fred_series_label, self._mkt_fred_series_entry,
+            self._mkt_dates_label, self._mkt_dates_row,
+            self._mkt_csv_label, self._mkt_csv_row,
+        ]
+        if src == SOURCE_MARKET:
+            for w in wsj_bc: w.grid_remove()
             self._ref_label.grid_remove()
             self._ref_entry.grid_remove()
+            for w in mkt: w.grid()
+            self._run_btn.config(text="Fetch Data")
+        else:
+            for w in mkt: w.grid_remove()
+            for w in wsj_bc: w.grid()
+            self._run_btn.config(text="Run scrape")
+            if src == SOURCE_WSJ:
+                self.url_var.set(WSJ_URL)
+                self.output_var.set(str(HERE / "wsj_treasuries.xlsx"))
+                self._ref_label.grid()
+                self._ref_entry.grid()
+            else:
+                self.url_var.set(BARCHART_URL)
+                self.output_var.set(str(HERE / "barchart_futures.xlsx"))
+                self._ref_label.grid_remove()
+                self._ref_entry.grid_remove()
+
 
     def _set_status(self, text: str) -> None:
         self.status_var.set(text)
@@ -284,9 +495,14 @@ class TreasuryApp(Tk):
                 f"Could not import wsj_treasury_scraper: {_import_error}")
             return
         src = self.source_var.get()
-        self._set_status(f"Running scrape ({src})…")
-        self._log(f"─── Starting {src} scrape ───")
-        target = self._run_barchart if src == SOURCE_BARCHART else self._run_wsj
+        self._set_status(f"Running ({src})…")
+        self._log(f"─── Starting {src} ───")
+        if src == SOURCE_MARKET:
+            target = self._run_mkt
+        elif src == SOURCE_BARCHART:
+            target = self._run_barchart
+        else:
+            target = self._run_wsj
         self._worker = threading.Thread(target=target, daemon=True)
         self._worker.start()
 
@@ -344,6 +560,8 @@ class TreasuryApp(Tk):
             output = Path(self.output_var.get().strip()).expanduser()
 
             self.after(0, lambda: self._log("Scraping Barchart futures table…"))
+            # Ensure Chromium is available (installs on first run if needed)
+            _ensure_playwright_chromium(log_fn=lambda m: self.after(0, lambda m=m: self._log(m)))
             df = scraper.scrape_barchart_futures(
                 url, log=lambda m: self.after(0, lambda m=m: self._log(m)),
             )
@@ -379,10 +597,14 @@ class TreasuryApp(Tk):
             self.tree.insert("", END, values=[str(v) for v in row.tolist()])
         self._log(f"Preview updated ({min(len(df), 100)} of {len(df)} rows shown).")
 
-        # Update chart controls (WSJ only)
+        # Update chart controls
         if _MPL and is_wsj:
             self._rebuild_chart_controls(df)
             self._draw_chart()
+        elif _MPL and not is_wsj:
+            self._current_bc_df = df
+            self._rebuild_bc_chart_controls(df)
+            self._draw_bc_chart()
 
     def _rebuild_chart_controls(self, df) -> None:
         """Rebuild the series checkboxes and X-axis dropdown from the new dataframe."""
@@ -413,6 +635,85 @@ class TreasuryApp(Tk):
             self._x_var.set("Maturity")
         elif x_options:
             self._x_var.set(x_options[0])
+
+    # ── WSJ select / deselect all ──────────────────────────────────────────────
+    def _wsj_select_all(self) -> None:
+        for var in self._chart_vars.values():
+            var.set(True)
+        self._draw_chart()
+
+    def _wsj_deselect_all(self) -> None:
+        for var in self._chart_vars.values():
+            var.set(False)
+        self._draw_chart()
+
+    # ── Barchart select / deselect all ─────────────────────────────────────────
+    def _bc_select_all(self) -> None:
+        for var in self._chart_bc_vars.values():
+            var.set(True)
+        self._draw_bc_chart()
+
+    def _bc_deselect_all(self) -> None:
+        for var in self._chart_bc_vars.values():
+            var.set(False)
+        self._draw_bc_chart()
+
+    def _rebuild_bc_chart_controls(self, df) -> None:
+        """Rebuild Barchart series checkboxes — Latest and Change only."""
+        for widget in self._bc_checkbox_frame.winfo_children():
+            widget.destroy()
+        self._chart_bc_vars.clear()
+
+        for col in ("Latest", "Change"):
+            if col in df.columns:
+                var = BooleanVar(value=True)
+                self._chart_bc_vars[col] = var
+                ttk.Checkbutton(self._bc_checkbox_frame, text=col, variable=var,
+                                command=self._draw_bc_chart).pack(anchor=W)
+
+    def _draw_bc_chart(self) -> None:
+        """Draw a line chart of Latest / Change by Contract Name."""
+        if not _MPL or self._current_bc_df is None:
+            return
+
+        import pandas as pd
+
+        df = self._current_bc_df.copy()
+        selected = [col for col, var in self._chart_bc_vars.items() if var.get()]
+
+        self._bc_ax.clear()
+
+        if not selected:
+            self._bc_ax.set_title("No series selected")
+            self._bc_canvas.draw()
+            return
+
+        # Use Contract Name as X labels, fall back to Symbol
+        if "Contract Name" in df.columns:
+            labels = df["Contract Name"].astype(str).tolist()
+        elif "Symbol" in df.columns:
+            labels = df["Symbol"].astype(str).tolist()
+        else:
+            labels = [str(i) for i in range(len(df))]
+
+        x = range(len(labels))
+
+        for col in selected:
+            y_vals = pd.to_numeric(df[col], errors="coerce")
+            self._bc_ax.plot(list(x), y_vals.tolist(), marker="o",
+                             markersize=5, linewidth=1.5, label=col)
+
+        self._bc_ax.set_xticks(list(x))
+        self._bc_ax.set_xticklabels(labels, rotation=40, ha="right", fontsize=8)
+        self._bc_ax.axhline(0, color="black", linewidth=0.6, linestyle="--")
+        self._bc_ax.set_title("Barchart Futures — Latest & Change")
+        self._bc_ax.set_ylabel("Price (decimal)")
+        self._bc_ax.legend(fontsize=9)
+        self._bc_ax.grid(True, linestyle="--", alpha=0.4)
+        self._bc_fig.tight_layout()
+        self._bc_canvas.draw()
+        # Switch to barchart chart tab
+        self.notebook.select(2)
 
     def _draw_chart(self) -> None:
         """Redraw the matplotlib chart based on current checkbox selections."""
@@ -486,6 +787,279 @@ class TreasuryApp(Tk):
         self._canvas.draw()
         # Switch to chart tab automatically
         self.notebook.select(1)
+
+
+    # ── Market Data helpers ────────────────────────────────────────────────────
+
+    def _save_api_key(self) -> None:
+        key = self._fred_key_var.get().strip()
+        try:
+            self._api_key_file.write_text(key)
+            self._saved_api_key = key
+            self._log("FRED API key saved.")
+        except Exception as e:
+            messagebox.showerror("Save failed", str(e))
+
+    def _browse_mkt_output(self) -> None:
+        path = filedialog.asksaveasfilename(
+            title="Save CSV as",
+            defaultextension=".csv",
+            filetypes=[("CSV file", "*.csv"), ("All files", "*.*")],
+            initialfile=Path(self._mkt_output_var.get()).name,
+            initialdir=str(HERE),
+        )
+        if path:
+            self._mkt_output_var.set(path)
+
+    def _run_mkt(self) -> None:
+        if not self._fred_key_var.get().strip():
+            self.after(0, lambda: messagebox.showerror(
+                "Missing API key",
+                "Please enter your FRED API key.\nGet one free at fred.stlouisfed.org"))
+            self.after(0, lambda: self._set_status("Ready."))
+            return
+        try:
+            import pandas as pd
+            try:
+                import yfinance as yf
+            except ImportError:
+                self.after(0, lambda: self._log("Installing yfinance…"))
+                import subprocess
+                subprocess.run([sys.executable, "-m", "pip", "install", "yfinance"],
+                               capture_output=True)
+                import yfinance as yf
+
+            try:
+                from fredapi import Fred
+            except ImportError:
+                self.after(0, lambda: self._log("Installing fredapi…"))
+                import subprocess
+                subprocess.run([sys.executable, "-m", "pip", "install", "fredapi"],
+                               capture_output=True)
+                from fredapi import Fred
+
+            api_key    = self._fred_key_var.get().strip()
+            tickers    = [t.strip() for t in self._tickers_var.get().split(",") if t.strip()]
+            fred_series= [s.strip() for s in self._fred_series_var.get().split(",") if s.strip()]
+            start      = self._mkt_start_var.get().strip()
+            end        = self._mkt_end_var.get().strip()
+            output     = Path(self._mkt_output_var.get().strip()).expanduser()
+
+            # Yahoo Finance
+            self.after(0, lambda: self._log(f"Downloading Yahoo Finance: {tickers}…"))
+            yahoo_data = yf.download(
+                tickers, start=start, end=end,
+                auto_adjust=False, progress=False,
+            )
+            # Handle single vs multiple tickers
+            if len(tickers) == 1:
+                yahoo_data = yahoo_data[["Adj Close"]].rename(columns={"Adj Close": tickers[0]})
+            else:
+                yahoo_data = yahoo_data["Adj Close"]
+            yahoo_data = yahoo_data.dropna()
+            n_yahoo = len(yahoo_data)
+            self.after(0, lambda: self._log(f"  ✓ Yahoo: {n_yahoo} rows, {list(yahoo_data.columns)}"))
+
+            # FRED
+            self.after(0, lambda: self._log("Downloading FRED data…"))
+            fred = Fred(api_key=api_key)
+            fred_data = pd.DataFrame()
+            for series in fred_series:
+                try:
+                    fred_data[series] = fred.get_series(series, start, end)
+                    self.after(0, lambda s=series: self._log(f"  ✓ FRED: {s}"))
+                except Exception as e:
+                    self.after(0, lambda s=series, e=e: self._log(f"  ✗ FRED: {s} — {e}"))
+
+            # Merge
+            combined = yahoo_data.join(fred_data, how="inner").dropna()
+            combined = combined.reset_index()
+            combined.rename(columns={combined.columns[0]: "Time"}, inplace=True)
+            combined["Time"] = pd.to_datetime(combined["Time"]).dt.strftime("%Y%m%d")
+
+            # Save
+            output.parent.mkdir(parents=True, exist_ok=True)
+            combined.to_csv(output, index=False)
+            n = len(combined)
+            cols = list(combined.columns)
+
+            self.after(0, lambda: self._current_mkt_df_set(combined))
+            self.after(0, lambda: self._log(f"✓ Saved {n} rows to {output.resolve()}"))
+            self.after(0, lambda: self._log(f"  Columns: {cols}"))
+            self.after(0, lambda: self._set_status(f"Done — {n} rows saved to {output.name}"))
+
+        except Exception as exc:
+            tb = traceback.format_exc()
+            self.after(0, lambda: self._log(tb))
+            self.after(0, lambda: self._set_status("Failed — see log for details."))
+
+    def _current_mkt_df_set(self, df) -> None:
+        """Called on main thread after fetch completes."""
+        self._current_mkt_df = df
+        if _MPL:
+            self._rebuild_mkt_chart_controls(df)
+            self._draw_mkt_chart()
+
+    def _rebuild_mkt_chart_controls(self, df) -> None:
+        import pandas as pd
+        for widget in self._mkt_checkbox_frame.winfo_children():
+            widget.destroy()
+        self._chart_mkt_vars.clear()
+
+        skip = {"Time"}
+        for col in df.columns:
+            if col in skip:
+                continue
+            var = BooleanVar(value=True)
+            self._chart_mkt_vars[col] = var
+            ttk.Checkbutton(self._mkt_checkbox_frame, text=col, variable=var,
+                            command=self._draw_mkt_chart).pack(side=LEFT)
+
+    def _mkt_select_all(self) -> None:
+        for var in self._chart_mkt_vars.values():
+            var.set(True)
+        self._draw_mkt_chart()
+
+    def _mkt_deselect_all(self) -> None:
+        for var in self._chart_mkt_vars.values():
+            var.set(False)
+        self._draw_mkt_chart()
+
+    def _draw_mkt_chart(self) -> None:
+        if not _MPL or self._current_mkt_df is None:
+            return
+
+        import pandas as pd
+        import matplotlib.dates as mdates
+
+        df = self._current_mkt_df.copy()
+        selected = [col for col, var in self._chart_mkt_vars.items() if var.get()]
+
+        self._mkt_ax.clear()
+
+        if not selected:
+            self._mkt_ax.set_title("No series selected")
+            self._mkt_canvas.draw()
+            return
+
+        df["_date"] = pd.to_datetime(df["Time"], format="%Y%m%d", errors="coerce")
+        df = df.sort_values("_date")
+
+        for col in selected:
+            y = pd.to_numeric(df[col], errors="coerce")
+            self._mkt_ax.plot(df["_date"], y, linewidth=1.2, label=col)
+
+        self._mkt_ax.set_title("Market Data — Yahoo Finance & FRED")
+        self._mkt_ax.set_xlabel("Date")
+        self._mkt_ax.legend(fontsize=8, loc="best")
+        self._mkt_ax.grid(True, linestyle="--", alpha=0.4)
+
+        date_range = (df["_date"].max() - df["_date"].min()).days
+        if date_range > 365 * 5:
+            self._mkt_ax.xaxis.set_major_locator(mdates.YearLocator(2))
+            self._mkt_ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+        elif date_range > 365:
+            self._mkt_ax.xaxis.set_major_locator(mdates.YearLocator())
+            self._mkt_ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+        else:
+            self._mkt_ax.xaxis.set_major_locator(mdates.MonthLocator())
+            self._mkt_ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+
+        self._mkt_fig.autofmt_xdate(rotation=45, ha="right")
+        self._mkt_canvas.draw()
+        self.notebook.select(3)
+
+    # ── Regression (Bond_Regress) ──────────────────────────────────────────────
+
+    def _run_regression_clicked(self) -> None:
+        if self._worker and self._worker.is_alive():
+            messagebox.showinfo("Busy", "A task is already running.")
+            return
+        if self._current_mkt_df is None:
+            messagebox.showinfo("No data", "Fetch Market Data first (HYG, SPY, ^TNX, etc.).")
+            return
+        self._set_status("Running regression…")
+        self._log("─── Starting bond return regression ───")
+        self._worker = threading.Thread(target=self._run_regression, daemon=True)
+        self._worker.start()
+
+    def _run_regression(self) -> None:
+        try:
+            import pandas as pd
+            try:
+                import statsmodels.formula.api as smf
+            except ImportError:
+                self.after(0, lambda: self._log("Installing statsmodels…"))
+                import subprocess
+                subprocess.run([sys.executable, "-m", "pip", "install", "statsmodels"],
+                               capture_output=True)
+                import statsmodels.formula.api as smf
+
+            df = self._current_mkt_df.copy()
+
+            # Map whatever Yahoo columns are present to the names Bond_Regress expects.
+            # HYG / SPY / ^TNX are the defaults, but allow flexibility if the user
+            # changed the ticker list.
+            rename_map = {}
+            for col in df.columns:
+                if col == "^TNX":
+                    rename_map[col] = "TNX"
+            df = df.rename(columns=rename_map)
+
+            required = {"HYG", "SPY", "TNX"}
+            missing = required - set(df.columns)
+            if missing:
+                raise ValueError(
+                    f"Regression requires columns {sorted(required)} but missing {sorted(missing)}.\n"
+                    f"Make sure your Yahoo Tickers include HYG, SPY, and ^TNX before fetching."
+                )
+
+            df["Date"] = pd.to_datetime(df["Time"], format="%Y%m%d")
+            df = df.sort_values("Date").reset_index(drop=True)
+
+            df["RHYG"] = df["HYG"] / df["HYG"].shift(1) - 1
+            df["RSP"]  = df["SPY"] / df["SPY"].shift(1) - 1
+            df["CHI"]  = df["TNX"] - df["TNX"].shift(1)
+
+            df_ret = df[["Date", "RHYG", "RSP", "CHI"]].dropna().reset_index(drop=True)
+
+            self.after(0, lambda: self._log(f"Computed returns for {len(df_ret)} rows."))
+
+            lines = []
+            lines.append("First 7 rows of return data:")
+            lines.append(df_ret.head(7).to_string(index=False))
+            lines.append("")
+            lines.append("Last 7 rows of return data:")
+            lines.append(df_ret.tail(7).to_string(index=False))
+            lines.append("")
+            lines.append("=" * 78)
+            lines.append("Model 1: RHYG ~ RSP")
+            lines.append("=" * 78)
+            model1 = smf.ols("RHYG ~ RSP", data=df_ret).fit()
+            lines.append(str(model1.summary()))
+            lines.append("")
+            lines.append("=" * 78)
+            lines.append("Model 2: RHYG ~ RSP + CHI")
+            lines.append("=" * 78)
+            model2 = smf.ols("RHYG ~ RSP + CHI", data=df_ret).fit()
+            lines.append(str(model2.summary()))
+
+            output_text = "\n".join(lines)
+            self.after(0, lambda: self._show_regression_results(output_text))
+            self.after(0, lambda: self._log("✓ Regression complete."))
+            self.after(0, lambda: self._set_status("Regression complete — see Regression tab."))
+
+        except Exception as exc:
+            tb = traceback.format_exc()
+            self.after(0, lambda: self._log(tb))
+            self.after(0, lambda: self._set_status("Failed — see log for details."))
+
+    def _show_regression_results(self, text: str) -> None:
+        self._regress_text.config(state="normal")
+        self._regress_text.delete("1.0", END)
+        self._regress_text.insert(END, text)
+        self._regress_text.config(state="disabled")
+        self.notebook.select(4)
 
 
 def _write_crash_log(text: str) -> None:
