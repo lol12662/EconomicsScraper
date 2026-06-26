@@ -1432,13 +1432,16 @@ def _convert_treasury_price(val: str) -> str:
       XX-YY      → XX + YY/32
       XX-YYZ     → XX + YY/32 + Z/8/32   (Z is a single digit: 2=¼, 4=½, 6=¾)
       XX-YY+     → XX + YY/32 + 0.5/32   ('+' means half a 32nd)
+      Trailing letters (e.g. 's' for "settlement") are stripped before parsing.
       Anything not matching is returned unchanged.
 
     Examples:
-      "97-08"  → 97.25       (8/32 = 0.25)
-      "111-22" → 111.6875    (22/32 = 0.6875)
-      "109-162"→ 109.515625  (16/32 + 2/8/32)
-      "97-08+" → 97.265625   (8/32 + 0.5/32)
+      "97-08"    → 97.25        (8/32 = 0.25)
+      "111-22"   → 111.6875     (22/32 = 0.6875)
+      "109-162"  → 109.515625   (16/32 + 2/8/32)
+      "97-08+"   → 97.265625    (8/32 + 0.5/32)
+      "113-23s"  → 113.71875    (23/32, trailing 's' stripped)
+      "109-305s" → 109.957031   (30/32 + 5/8/32, trailing 's' stripped)
     """
     if not isinstance(val, str):
         return str(val)
@@ -1449,6 +1452,9 @@ def _convert_treasury_price(val: str) -> str:
     if s.startswith(("+", "-")):
         sign = -1 if s[0] == "-" else 1
         s = s[1:].strip()
+
+    # Strip trailing letter flags (e.g. Barchart's 's' for "settlement")
+    s = re.sub(r"[a-zA-Z]+$", "", s)
 
     # Match: whole-YY or whole-YYZ or whole-YY+
     m = re.match(r"^(\d+)-(\d{2,3})(\+?)$", s)
@@ -1485,10 +1491,19 @@ def _postprocess_barchart(df: pd.DataFrame, log: Any = None) -> pd.DataFrame:
 
     before = len(df)
 
-    # 1. Drop rows where Symbol is blank or looks like a header repeat
+    # 1. Drop rows where Symbol is blank, or the row looks like a header/schema
+    #    placeholder (e.g. literal column names or type names like "string", "price")
     if "Symbol" in df.columns:
-        df = df[df["Symbol"].str.strip().str.len() > 0]
-        df = df[~df["Symbol"].str.lower().isin({"symbol", "contract", "name"})]
+        df = df[df["Symbol"].astype(str).str.strip().str.len() > 0]
+        junk_values = {
+            "symbol", "contract", "name", "string", "integer", "number",
+            "price", "pricechange", "float", "int", "text", "date", "time",
+        }
+        df = df[~df["Symbol"].astype(str).str.strip().str.lower().isin(junk_values)]
+        if "Contract Name" in df.columns:
+            df = df[~df["Contract Name"].astype(str).str.strip().str.lower().isin(junk_values)]
+        if "Latest" in df.columns:
+            df = df[~df["Latest"].astype(str).str.strip().str.lower().isin(junk_values)]
 
     # 2. Drop exact duplicates on Symbol (keep first occurrence)
     if "Symbol" in df.columns:
