@@ -104,6 +104,7 @@ class TreasuryApp(Tk):
         self.url_var       = StringVar(value=WSJ_URL)
         self.output_var    = StringVar(value=str(HERE / "wsj_treasuries.xlsx"))
         self.reference_var = StringVar(value="")
+        self.delta_var     = StringVar(value="0.01")   # Delta: yield shift (decimal fraction)
         self.status_var    = StringVar(value="Ready.")
 
         self._worker: threading.Thread | None = None
@@ -163,6 +164,11 @@ class TreasuryApp(Tk):
         self._ref_entry = Entry(top, textvariable=self.reference_var)
         self._ref_entry.grid(row=3, column=1, sticky="we", padx=(8, 8), pady=(0, 4))
 
+        self._delta_label = Label(top, text="Delta (yield shift, e.g. 0.01 = 1%)")
+        self._delta_label.grid(row=4, column=0, sticky="w", pady=(0, 4))
+        self._delta_entry = Entry(top, textvariable=self.delta_var, width=12)
+        self._delta_entry.grid(row=4, column=1, sticky="w", padx=(8, 8), pady=(0, 4))
+
         # ── Market Data fields (hidden by default) ─────────────────────────────
         self._mkt_fred_label = Label(top, text="FRED API Key")
         self._mkt_fred_label.grid(row=1, column=0, sticky="w", pady=(0, 4))
@@ -206,13 +212,13 @@ class TreasuryApp(Tk):
 
         # ── Action buttons ─────────────────────────────────────────────────────
         btn_row = Frame(top)
-        btn_row.grid(row=6, column=1, sticky="w", padx=(8, 8), pady=(6, 2))
+        btn_row.grid(row=7, column=1, sticky="w", padx=(8, 8), pady=(6, 2))
         self._run_btn = Button(btn_row, text="Run scrape", command=self._run_clicked, width=16)
         self._run_btn.pack(side=LEFT)
         Button(btn_row, text="Open output folder", command=self._open_output_folder, width=18).pack(side=LEFT, padx=(8, 0))
 
         log_btn_row = Frame(top)
-        log_btn_row.grid(row=7, column=1, sticky="w", padx=(8, 8), pady=(2, 8))
+        log_btn_row.grid(row=8, column=1, sticky="w", padx=(8, 8), pady=(2, 8))
         Button(log_btn_row, text="Save log…", command=self._save_log, width=14).pack(side=LEFT)
         Button(log_btn_row, text="Clear log",  command=self._clear_log, width=12).pack(side=LEFT, padx=(8, 0))
 
@@ -355,7 +361,40 @@ class TreasuryApp(Tk):
             Label(mkt_chart_tab, text="Install matplotlib to see chart.\npip install matplotlib",
                   justify="center").pack(expand=True)
 
-        # ── Tab 5: Regression (Bond Returns) ────────────────────────────────────
+        # ── Tab 5: FRED Data Preview ───────────────────────────────────────────
+        fred_preview_tab = Frame(self.notebook)
+        self.notebook.add(fred_preview_tab, text="FRED Preview")
+
+        # Header row with column filter
+        fred_hdr = Frame(fred_preview_tab)
+        fred_hdr.pack(fill=X, padx=8, pady=(6, 4))
+        Label(fred_hdr, text="Showing fetched FRED + Yahoo data  ").pack(side=LEFT)
+        Label(fred_hdr, text="Filter columns:").pack(side=LEFT)
+        self._fred_filter_var = StringVar(value="")
+        self._fred_filter_var.trace_add("write", lambda *_: self._apply_fred_filter())
+        Entry(fred_hdr, textvariable=self._fred_filter_var, width=20).pack(side=LEFT, padx=(4, 0))
+        Button(fred_hdr, text="Clear", command=lambda: self._fred_filter_var.set(""),
+               width=6).pack(side=LEFT, padx=(4, 0))
+        self._fred_row_label = Label(fred_hdr, text="", foreground="gray")
+        self._fred_row_label.pack(side=RIGHT)
+
+        # Treeview with both scrollbars
+        fred_tree_frame = Frame(fred_preview_tab)
+        fred_tree_frame.pack(fill=BOTH, expand=True, padx=8, pady=(0, 8))
+
+        fred_ysc = ttk.Scrollbar(fred_tree_frame, orient="vertical")
+        fred_xsc = ttk.Scrollbar(fred_tree_frame, orient="horizontal")
+        fred_ysc.pack(side=RIGHT, fill=Y)
+        fred_xsc.pack(side="bottom", fill=X)
+
+        self._fred_tree = ttk.Treeview(fred_tree_frame, show="headings",
+                                        yscrollcommand=fred_ysc.set,
+                                        xscrollcommand=fred_xsc.set)
+        fred_ysc.config(command=self._fred_tree.yview)
+        fred_xsc.config(command=self._fred_tree.xview)
+        self._fred_tree.pack(fill=BOTH, expand=True)
+
+        # ── Tab 6: Regression (Bond Returns) ────────────────────────────────────
         regress_tab = Frame(self.notebook)
         self.notebook.add(regress_tab, text="Regression")
 
@@ -421,6 +460,8 @@ class TreasuryApp(Tk):
             for w in wsj_bc: w.grid_remove()
             self._ref_label.grid_remove()
             self._ref_entry.grid_remove()
+            self._delta_label.grid_remove()
+            self._delta_entry.grid_remove()
             for w in mkt: w.grid()
             self._run_btn.config(text="Fetch Data")
         else:
@@ -432,11 +473,15 @@ class TreasuryApp(Tk):
                 self.output_var.set(str(HERE / "wsj_treasuries.xlsx"))
                 self._ref_label.grid()
                 self._ref_entry.grid()
+                self._delta_label.grid()
+                self._delta_entry.grid()
             else:
                 self.url_var.set(BARCHART_URL)
                 self.output_var.set(str(HERE / "barchart_futures.xlsx"))
                 self._ref_label.grid_remove()
                 self._ref_entry.grid_remove()
+                self._delta_label.grid_remove()
+                self._delta_entry.grid_remove()
 
 
     def _set_status(self, text: str) -> None:
@@ -515,11 +560,22 @@ class TreasuryApp(Tk):
             ref_raw = self.reference_var.get().strip()
             reference_date = scraper.get_reference_date(url, ref_raw or None)
 
+            # Parse Delta (default 0.01 = 1% if blank or invalid)
+            try:
+                delta = float(self.delta_var.get().strip())
+                if delta <= 0:
+                    raise ValueError("Delta must be positive")
+            except ValueError:
+                delta = 0.01
+                self.after(0, lambda: self._log("Invalid Delta — using default 0.01 (1%)"))
+
+            delta_pct = delta * 100
             self.after(0, lambda: self._log(f"Reference date: {reference_date.isoformat()}"))
+            self.after(0, lambda dp=delta_pct: self._log(f"Delta: {delta} ({dp:.4g}% yield shift)"))
             self.after(0, lambda: self._log("Scraping Treasury table…"))
 
             df = scraper.scrape_treasuries(url)
-            df = scraper.add_payment_columns(df, reference_date)
+            df = scraper.add_payment_columns(df, reference_date, delta=delta)
 
             output.parent.mkdir(parents=True, exist_ok=True)
             formula_rows = 14
@@ -531,17 +587,17 @@ class TreasuryApp(Tk):
                 ws["A1"]  = "Treasury Formulas"
                 ws["A2"]  = "Coupon Payment";    ws["B2"]  = "Coupon/2*1000"
                 ws["A3"]  = "PV0";               ws["B3"]  = "PV(Ask Yield/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
-                ws["A4"]  = "PV1";               ws["B4"]  = "PV((Ask Yield+1%)/2, Number of Payments Until Maturity-2, Coupon Payment, 1000)"
+                ws["A4"]  = "PV1";               ws["B4"]  = f"PV((Ask Yield+{delta_pct:.4g}%)/2, Number of Payments Until Maturity-2, Coupon Payment, 1000)"
                 ws["A5"]  = "P0";                ws["B5"]  = "PV0 * (1+Asked Yield/2)^(Days Since Last Payment/182)"
-                ws["A6"]  = "P1";                ws["B6"]  = "PV1 * (1+(Asked Yield+1%)/2)^(Days Since Last Payment/182)"
+                ws["A6"]  = "P1";                ws["B6"]  = f"PV1 * (1+(Asked Yield+{delta_pct:.4g}%)/2)^(Days Since Last Payment/182)"
                 ws["A7"]  = "Simulated Return";  ws["B7"]  = "(P1- P0 + Coupon*10)/P0"
                 ws["A8"]  = "MACAULAY DURATION"; ws["B8"]  = "DURATION(Current Date, Maturity Date, Coupon Rate, Ask Yield, 2)"
                 ws["A9"]  = "MODIFIED DURATION"; ws["B9"]  = "MDURATION(Current Date, Maturity Date, Coupon Rate, Ask Yield, 2)"
-                ws["A10"] = "PVUP";              ws["B10"] = "PV(Ask Yield+1%/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
-                ws["A11"] = "PVDN";              ws["B11"] = "PV(Ask Yield-1%/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
-                ws["A12"] = "PUP";               ws["B12"] = "PVUP * (1+(Asked Yield+1%)/2)^(Days Since Last Payment/182)"
-                ws["A13"] = "PDN";               ws["B13"] = "PVDN * (1+(Asked Yield-1%)/2)^(Days Since Last Payment/182)"
-                ws["A14"] = "EFDURATION";        ws["B14"] = "(PDN- PUP)/(2*.01*P0)"
+                ws["A10"] = "PVUP";              ws["B10"] = f"PV(Ask Yield+{delta_pct:.4g}%/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
+                ws["A11"] = "PVDN";              ws["B11"] = f"PV(Ask Yield-{delta_pct:.4g}%/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
+                ws["A12"] = "PUP";               ws["B12"] = f"PVUP * (1+(Asked Yield+{delta_pct:.4g}%)/2)^(Days Since Last Payment/182)"
+                ws["A13"] = "PDN";               ws["B13"] = f"PVDN * (1+(Asked Yield-{delta_pct:.4g}%)/2)^(Days Since Last Payment/182)"
+                ws["A14"] = "EFDURATION";        ws["B14"] = f"(PDN- PUP)/(2*{delta}*P0)"
 
             n = len(df)
             self.after(0, lambda: self._update_preview(df, is_wsj=True))
@@ -896,9 +952,73 @@ class TreasuryApp(Tk):
     def _current_mkt_df_set(self, df) -> None:
         """Called on main thread after fetch completes."""
         self._current_mkt_df = df
+        self._populate_fred_preview(df)
         if _MPL:
             self._rebuild_mkt_chart_controls(df)
             self._draw_mkt_chart()
+
+    def _populate_fred_preview(self, df) -> None:
+        """Fill the FRED Preview treeview with the full combined dataframe."""
+        self._fred_preview_df = df.copy()
+        self._apply_fred_filter()
+
+    def _apply_fred_filter(self) -> None:
+        """Re-render the FRED treeview, optionally filtering visible columns."""
+        if not hasattr(self, "_fred_preview_df") or self._fred_preview_df is None:
+            return
+        df = self._fred_preview_df
+        filt = self._fred_filter_var.get().strip().lower()
+
+        # Determine which columns to show
+        if filt:
+            cols = [c for c in df.columns if filt in c.lower()]
+            # Always keep Time if it exists
+            if "Time" in df.columns and "Time" not in cols:
+                cols = ["Time"] + cols
+        else:
+            cols = list(df.columns)
+
+        if not cols:
+            self._fred_row_label.config(text="No columns match filter")
+            return
+
+        view = df[cols]
+
+        # Rebuild treeview columns
+        self._fred_tree.delete(*self._fred_tree.get_children())
+        self._fred_tree["columns"] = cols
+        COL_W = 110
+        for col in cols:
+            self._fred_tree.heading(col, text=col,
+                                    command=lambda c=col: self._fred_sort(c))
+            self._fred_tree.column(col, width=max(COL_W, len(col) * 9),
+                                   minwidth=70, stretch=False, anchor="center")
+
+        # Insert rows (all rows — treeview scrolls)
+        for _, row in view.iterrows():
+            self._fred_tree.insert("", END, values=[str(v) for v in row.tolist()])
+
+        n = len(view)
+        self._fred_row_label.config(
+            text=f"{n} rows × {len(cols)} cols")
+        self.notebook.select(4)   # jump to FRED Preview tab
+
+    def _fred_sort(self, col: str) -> None:
+        """Click a column header to sort by that column."""
+        if not hasattr(self, "_fred_preview_df") or self._fred_preview_df is None:
+            return
+        import pandas as pd
+        df = self._fred_preview_df
+        try:
+            # Try numeric sort, fall back to string
+            sorted_df = df.sort_values(
+                col,
+                key=lambda s: pd.to_numeric(s, errors="coerce").fillna(float("inf")),
+            )
+        except Exception:
+            sorted_df = df.sort_values(col, key=lambda s: s.astype(str))
+        self._fred_preview_df = sorted_df.reset_index(drop=True)
+        self._apply_fred_filter()
 
     def _rebuild_mkt_chart_controls(self, df) -> None:
         import pandas as pd

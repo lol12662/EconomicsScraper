@@ -1695,9 +1695,28 @@ def modified_duration(
 # OUTPUT ENRICHMENT
 # ============================================================
 
-def add_payment_columns(df: pd.DataFrame, reference_date: date) -> pd.DataFrame:
+def add_payment_columns(
+    df: pd.DataFrame,
+    reference_date: date,
+    delta: float = 0.01,
+) -> pd.DataFrame:
+    """Compute bond analytics columns.
+
+    Parameters
+    ----------
+    df             : DataFrame from scrape_treasuries()
+    reference_date : settlement / article date
+    delta          : yield shift used for PV1/P1/PVUP/PVDN/EF_DURATION.
+                     Expressed as a decimal fraction, e.g. 0.01 = 1%, 0.007 = 0.7%.
+                     Default is 0.01 (1%).
+    """
     df = df.copy()
 
+    # Convert delta to percentage-point units (same scale as Asked Yield column)
+    # Asked Yield is stored as e.g. 4.31 (meaning 4.31%), so delta_pp = 0.007*100 = 0.7
+    delta_pp = delta * 100.0
+
+    df["Delta"] = delta          # store the raw decimal value for reference
     df["Article Date"] = reference_date
 
     df["Previous Payment Date"] = df["Maturity"].apply(
@@ -1728,41 +1747,41 @@ def add_payment_columns(df: pd.DataFrame, reference_date: date) -> pd.DataFrame:
     )
     df["PV1"] = df.apply(
         lambda row: bond_future_value(
-            ask_yield=row["Asked Yield"],
+            ask_yield=row["Asked Yield"] + delta_pp,
             payments_until_maturity=row["Payments Until Maturity"],
             coupon_payment=row["Coupon Payment"],
             face_value=1000,
         ),
         axis=1,
     )
-    df["P0"] = df["PV0"] * (1+df["Asked Yield"]/200)**(df["Days Since Previous Payment"]/182)
-    df["P1"] = df["PV1"] * (1+(df["Asked Yield"]+1)/200)**(df["Days Since Previous Payment"]/182)
-    df["Simulated Return"] = (df["P1"] - df["P0"] + df["Coupon"]*10)/df["P0"]
+    df["P0"] = df["PV0"] * (1 + df["Asked Yield"] / 200) ** (df["Days Since Previous Payment"] / 182)
+    df["P1"] = df["PV1"] * (1 + (df["Asked Yield"] + delta_pp) / 200) ** (df["Days Since Previous Payment"] / 182)
+    df["Simulated Return"] = (df["P1"] - df["P0"] + df["Coupon"] * 10) / df["P0"]
     df["MACAULAY DURATION"] = df.apply(
         lambda row: macaulay_duration(
-        settlement_date=reference_date,
-        maturity_date=row["Maturity"],
-        coupon_rate=row["Coupon"]/100,
-        ask_yield=row["Asked Yield"]/100,
-        face_value=1000,
-        frequency=2,
+            settlement_date=reference_date,
+            maturity_date=row["Maturity"],
+            coupon_rate=row["Coupon"] / 100,
+            ask_yield=row["Asked Yield"] / 100,
+            face_value=1000,
+            frequency=2,
         ),
         axis=1,
     )
     df["MODIFIED DURATION"] = df.apply(
         lambda row: modified_duration(
-        settlement_date=reference_date,
-        maturity_date=row["Maturity"],
-        coupon_rate=row["Coupon"]/100,
-        ask_yield=row["Asked Yield"]/100,
-        face_value=1000,
-        frequency=2,
+            settlement_date=reference_date,
+            maturity_date=row["Maturity"],
+            coupon_rate=row["Coupon"] / 100,
+            ask_yield=row["Asked Yield"] / 100,
+            face_value=1000,
+            frequency=2,
         ),
         axis=1,
-        )
+    )
     df["PVUP"] = df.apply(
         lambda row: bond_present_value(
-            ask_yield=row["Asked Yield"]+1,
+            ask_yield=row["Asked Yield"] + delta_pp,
             payments_until_maturity=row["Payments Until Maturity"],
             coupon_payment=row["Coupon Payment"],
             face_value=1000,
@@ -1771,16 +1790,16 @@ def add_payment_columns(df: pd.DataFrame, reference_date: date) -> pd.DataFrame:
     )
     df["PVDN"] = df.apply(
         lambda row: bond_present_value(
-            ask_yield=row["Asked Yield"]-1,
+            ask_yield=row["Asked Yield"] - delta_pp,
             payments_until_maturity=row["Payments Until Maturity"],
             coupon_payment=row["Coupon Payment"],
             face_value=1000,
         ),
         axis=1,
     )
-    df["PUP"] = df["PVUP"] * (1+(df["Asked Yield"]+1)/200)**(df["Days Since Previous Payment"]/182)
-    df["PDN"] = df["PVDN"] * (1+(df["Asked Yield"]-1)/200)**(df["Days Since Previous Payment"]/182)
-    df["EF_DURATION"] = (df["PDN"]- df["PUP"])/(2*.01*df["P0"])
+    df["PUP"] = df["PVUP"] * (1 + (df["Asked Yield"] + delta_pp) / 200) ** (df["Days Since Previous Payment"] / 182)
+    df["PDN"] = df["PVDN"] * (1 + (df["Asked Yield"] - delta_pp) / 200) ** (df["Days Since Previous Payment"] / 182)
+    df["EF_DURATION"] = (df["PDN"] - df["PUP"]) / (2 * delta * df["P0"])
     return df
 
 
@@ -1802,6 +1821,15 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         "--reference-date",
         default=None,
         help="(WSJ only) Override the article date with YYYY-MM-DD",
+    )
+    parser.add_argument(
+        "--delta",
+        type=float,
+        default=0.01,
+        help=(
+            "(WSJ only) Yield shift for PV1, P1, PVUP, PVDN, EF_DURATION. "
+            "Expressed as a decimal fraction: 0.01 = 1%% (default), 0.007 = 0.7%%."
+        ),
     )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
@@ -1827,8 +1855,9 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
     reference_date = get_reference_date(url, args.reference_date)
     df = scrape_treasuries(url)
-    df = add_payment_columns(df, reference_date)
+    df = add_payment_columns(df, reference_date, delta=args.delta)
 
+    delta_pct = args.delta * 100
     formula_rows = 14
     sheet_name = "Treasuries"
 
@@ -1838,17 +1867,17 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         ws["A1"]  = "Treasury Formulas"
         ws["A2"]  = "Coupon Payment";    ws["B2"]  = "Coupon/2*1000"
         ws["A3"]  = "PV0";               ws["B3"]  = "PV(Ask Yield/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
-        ws["A4"]  = "PV1";               ws["B4"]  = "PV((Ask Yield+1%)/2, Number of Payments Until Maturity-2, Coupon Payment, 1000)"
+        ws["A4"]  = "PV1";               ws["B4"]  = f"PV((Ask Yield+{delta_pct}%)/2, Number of Payments Until Maturity-2, Coupon Payment, 1000)"
         ws["A5"]  = "P0";                ws["B5"]  = "PV0 * (1+Asked Yield/2)^(Days Since Last Payment/182)"
-        ws["A6"]  = "P1";                ws["B6"]  = "PV1 * (1+(Asked Yield+1%)/2)^(Days Since Last Payment/182)"
+        ws["A6"]  = "P1";                ws["B6"]  = f"PV1 * (1+(Asked Yield+{delta_pct}%)/2)^(Days Since Last Payment/182)"
         ws["A7"]  = "Simulated Return";  ws["B7"]  = "(P1- P0 + Coupon*10)/P0"
         ws["A8"]  = "MACAULAY DURATION"; ws["B8"]  = "DURATION(Current Date, Maturity Date, Coupon Rate, Ask Yield, 2)"
         ws["A9"]  = "MODIFIED DURATION"; ws["B9"]  = "MDURATION(Current Date, Maturity Date, Coupon Rate, Ask Yield, 2)"
-        ws["A10"] = "PVUP";              ws["B10"] = "PV(Ask Yield+1%/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
-        ws["A11"] = "PVDN";              ws["B11"] = "PV(Ask Yield-1%/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
-        ws["A12"] = "PUP";               ws["B12"] = "PVUP * (1+(Asked Yield+1%)/2)^(Days Since Last Payment/182)"
-        ws["A13"] = "PDN";               ws["B13"] = "PVDN * (1+(Asked Yield-1%)/2)^(Days Since Last Payment/182)"
-        ws["A14"] = "EFDURATION";        ws["B14"] = "(PDN- PUP)/(2*.01*P0)"
+        ws["A10"] = "PVUP";              ws["B10"] = f"PV(Ask Yield+{delta_pct}%/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
+        ws["A11"] = "PVDN";              ws["B11"] = f"PV(Ask Yield-{delta_pct}%/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
+        ws["A12"] = "PUP";               ws["B12"] = f"PVUP * (1+(Asked Yield+{delta_pct}%)/2)^(Days Since Last Payment/182)"
+        ws["A13"] = "PDN";               ws["B13"] = f"PVDN * (1+(Asked Yield-{delta_pct}%)/2)^(Days Since Last Payment/182)"
+        ws["A14"] = "EFDURATION";        ws["B14"] = f"(PDN- PUP)/(2*{args.delta}*P0)"
 
     print(f"Saved {len(df)} rows to {output_path.resolve()}")
     print(f"Reference date used: {reference_date.isoformat()}")
