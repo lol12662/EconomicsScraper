@@ -104,7 +104,8 @@ class TreasuryApp(Tk):
         self.url_var       = StringVar(value=WSJ_URL)
         self.output_var    = StringVar(value=str(HERE / "wsj_treasuries.xlsx"))
         self.reference_var = StringVar(value="")
-        self.delta_var     = StringVar(value="0.01")   # Delta: yield shift (decimal fraction)
+        self.delta_var          = StringVar(value="0.01")   # Delta: yield shift (decimal fraction)
+        self._last_reference_date = ""    # stored after each WSJ scrape for chart title
         self.status_var    = StringVar(value="Ready.")
 
         self._worker: threading.Thread | None = None
@@ -147,27 +148,27 @@ class TreasuryApp(Tk):
                             value=src, command=self._on_source_changed).pack(side=LEFT, padx=(0, 16))
 
         # ── WSJ / Barchart fields ──────────────────────────────────────────────
-        self._url_label = Label(top, text="URL")
-        self._url_label.grid(row=1, column=0, sticky="w", pady=(0, 4))
-        self._url_entry = Entry(top, textvariable=self.url_var)
-        self._url_entry.grid(row=1, column=1, sticky="we", padx=(8, 8), pady=(0, 4))
-
-        self._out_label = Label(top, text="Output file")
-        self._out_label.grid(row=2, column=0, sticky="w", pady=(0, 4))
-        self._out_row = Frame(top)
-        self._out_row.grid(row=2, column=1, sticky="we", padx=(8, 8), pady=(0, 4))
-        Entry(self._out_row, textvariable=self.output_var).pack(side=LEFT, fill=X, expand=True)
-        Button(self._out_row, text="Browse…", command=self._browse_output).pack(side=RIGHT, padx=(8, 0))
-
         self._ref_label = Label(top, text="Reference date (YYYY-MM-DD)")
-        self._ref_label.grid(row=3, column=0, sticky="w", pady=(0, 4))
+        self._ref_label.grid(row=1, column=0, sticky="w", pady=(0, 4))
         self._ref_entry = Entry(top, textvariable=self.reference_var)
-        self._ref_entry.grid(row=3, column=1, sticky="we", padx=(8, 8), pady=(0, 4))
+        self._ref_entry.grid(row=1, column=1, sticky="we", padx=(8, 8), pady=(0, 4))
 
         self._delta_label = Label(top, text="Delta (yield shift, e.g. 0.01 = 1%)")
-        self._delta_label.grid(row=4, column=0, sticky="w", pady=(0, 4))
+        self._delta_label.grid(row=2, column=0, sticky="w", pady=(0, 4))
         self._delta_entry = Entry(top, textvariable=self.delta_var, width=12)
-        self._delta_entry.grid(row=4, column=1, sticky="w", padx=(8, 8), pady=(0, 4))
+        self._delta_entry.grid(row=2, column=1, sticky="w", padx=(8, 8), pady=(0, 4))
+
+        self._url_label = Label(top, text="URL")
+        self._url_label.grid(row=3, column=0, sticky="w", pady=(0, 4))
+        self._url_entry = Entry(top, textvariable=self.url_var)
+        self._url_entry.grid(row=3, column=1, sticky="we", padx=(8, 8), pady=(0, 4))
+
+        self._out_label = Label(top, text="Output file")
+        self._out_label.grid(row=4, column=0, sticky="w", pady=(0, 4))
+        self._out_row = Frame(top)
+        self._out_row.grid(row=4, column=1, sticky="we", padx=(8, 8), pady=(0, 4))
+        Entry(self._out_row, textvariable=self.output_var).pack(side=LEFT, fill=X, expand=True)
+        Button(self._out_row, text="Browse…", command=self._browse_output).pack(side=RIGHT, padx=(8, 0))
 
         # ── Market Data fields (hidden by default) ─────────────────────────────
         self._mkt_fred_label = Label(top, text="FRED API Key")
@@ -570,7 +571,9 @@ class TreasuryApp(Tk):
                 self.after(0, lambda: self._log("Invalid Delta — using default 0.01 (1%)"))
 
             delta_pct = delta * 100
-            self.after(0, lambda: self._log(f"Reference date: {reference_date.isoformat()}"))
+            ref_iso = reference_date.isoformat()
+            self.after(0, lambda r=ref_iso: setattr(self, "_last_reference_date", r))
+            self.after(0, lambda r=ref_iso: self._log(f"Reference date: {r}"))
             self.after(0, lambda dp=delta_pct: self._log(f"Delta: {delta} ({dp:.4g}% yield shift)"))
             self.after(0, lambda: self._log("Scraping Treasury table…"))
 
@@ -578,26 +581,8 @@ class TreasuryApp(Tk):
             df = scraper.add_payment_columns(df, reference_date, delta=delta)
 
             output.parent.mkdir(parents=True, exist_ok=True)
-            formula_rows = 14
-            sheet_name   = "Treasuries"
-
-            with scraper.pd.ExcelWriter(output, engine="openpyxl") as writer:
-                df.to_excel(writer, index=False, sheet_name=sheet_name, startrow=formula_rows)
-                ws = writer.book[sheet_name]
-                ws["A1"]  = "Treasury Formulas"
-                ws["A2"]  = "Coupon Payment";    ws["B2"]  = "Coupon/2*1000"
-                ws["A3"]  = "PV0";               ws["B3"]  = "PV(Ask Yield/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
-                ws["A4"]  = "PV1";               ws["B4"]  = f"PV((Ask Yield+{delta_pct:.4g}%)/2, Number of Payments Until Maturity-2, Coupon Payment, 1000)"
-                ws["A5"]  = "P0";                ws["B5"]  = "PV0 * (1+Asked Yield/2)^(Days Since Last Payment/182)"
-                ws["A6"]  = "P1";                ws["B6"]  = f"PV1 * (1+(Asked Yield+{delta_pct:.4g}%)/2)^(Days Since Last Payment/182)"
-                ws["A7"]  = "Simulated Return";  ws["B7"]  = "(P1- P0 + Coupon*10)/P0"
-                ws["A8"]  = "MACAULAY DURATION"; ws["B8"]  = "DURATION(Current Date, Maturity Date, Coupon Rate, Ask Yield, 2)"
-                ws["A9"]  = "MODIFIED DURATION"; ws["B9"]  = "MDURATION(Current Date, Maturity Date, Coupon Rate, Ask Yield, 2)"
-                ws["A10"] = "PVUP";              ws["B10"] = f"PV(Ask Yield+{delta_pct:.4g}%/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
-                ws["A11"] = "PVDN";              ws["B11"] = f"PV(Ask Yield-{delta_pct:.4g}%/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
-                ws["A12"] = "PUP";               ws["B12"] = f"PVUP * (1+(Asked Yield+{delta_pct:.4g}%)/2)^(Days Since Last Payment/182)"
-                ws["A13"] = "PDN";               ws["B13"] = f"PVDN * (1+(Asked Yield-{delta_pct:.4g}%)/2)^(Days Since Last Payment/182)"
-                ws["A14"] = "EFDURATION";        ws["B14"] = f"(PDN- PUP)/(2*{delta}*P0)"
+            self._write_wsj_excel(df, output, delta, delta_pct, reference_date=reference_date)
+            self.after(0, lambda: self._log("  Regression sheet written to Sheet 2."))
 
             n = len(df)
             self.after(0, lambda: self._update_preview(df, is_wsj=True))
@@ -607,6 +592,87 @@ class TreasuryApp(Tk):
             tb = traceback.format_exc()
             self.after(0, lambda: self._log(tb))
             self.after(0, lambda: self._set_status("Failed — see log for details."))
+
+    def _write_wsj_excel(self, df, output: Path, delta: float, delta_pct: float,
+                          reference_date=None) -> None:
+        """Write Sheet 1 (data + formula legend) and Sheet 2 (regressions) to Excel."""
+        from openpyxl.styles import Font, PatternFill, Alignment
+        from datetime import date as _date
+
+        # Row 1: date header, Row 2: blank, Rows 3-16: formula legend, Row 17+: data
+        formula_rows = 16
+        sheet_name   = "Treasuries"
+
+        # Determine display date
+        if reference_date is not None:
+            display_date = reference_date.strftime("%B %d, %Y")
+            date_label   = f"Reference Date: {display_date}"
+        else:
+            display_date = _date.today().strftime("%B %d, %Y")
+            date_label   = f"Date: {display_date}"
+
+        with scraper.pd.ExcelWriter(output, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name=sheet_name, startrow=formula_rows)
+            ws = writer.book[sheet_name]
+
+            # ── Row 1: Date header ────────────────────────────────────────────
+            ws["A1"] = date_label
+            ws["A1"].font      = Font(bold=True, size=13, color="FFFFFF")
+            ws["A1"].fill      = PatternFill("solid", fgColor="1F4E79")
+            ws["A1"].alignment = Alignment(horizontal="left", vertical="center")
+            ws.row_dimensions[1].height = 22
+
+            # ── Rows 3–16: Formula legend ─────────────────────────────────────
+            ws["A3"]  = "Treasury Formulas"
+            ws["A3"].font = Font(bold=True)
+            ws["A4"]  = "Coupon Payment";    ws["B4"]  = "Coupon/2*1000"
+            ws["A5"]  = "PV0";               ws["B5"]  = "PV(Ask Yield/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
+            ws["A6"]  = "PV1";               ws["B6"]  = f"PV((Ask Yield+{delta_pct:.4g}%)/2, Number of Payments Until Maturity-2, Coupon Payment, 1000)"
+            ws["A7"]  = "P0";                ws["B7"]  = "PV0 * (1+Asked Yield/2)^(Days Since Last Payment/182)"
+            ws["A8"]  = "P1";                ws["B8"]  = f"PV1 * (1+(Asked Yield+{delta_pct:.4g}%)/2)^(Days Since Last Payment/182)"
+            ws["A9"]  = "Simulated Return";  ws["B9"]  = "(P1- P0 + Coupon*10)/P0"
+            ws["A10"] = "MACAULAY DURATION"; ws["B10"] = "DURATION(Current Date, Maturity Date, Coupon Rate, Ask Yield, 2)"
+            ws["A11"] = "MODIFIED DURATION"; ws["B11"] = "MDURATION(Current Date, Maturity Date, Coupon Rate, Ask Yield, 2)"
+            ws["A12"] = "PVUP";              ws["B12"] = f"PV(Ask Yield+{delta_pct:.4g}%/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
+            ws["A13"] = "PVDN";              ws["B13"] = f"PV(Ask Yield-{delta_pct:.4g}%/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
+            ws["A14"] = "PUP";               ws["B14"] = f"PVUP * (1+(Asked Yield+{delta_pct:.4g}%)/2)^(Days Since Last Payment/182)"
+            ws["A15"] = "PDN";               ws["B15"] = f"PVDN * (1+(Asked Yield-{delta_pct:.4g}%)/2)^(Days Since Last Payment/182)"
+            ws["A16"] = "EFDURATION";        ws["B16"] = f"(PDN- PUP)/(2*{delta}*P0)"
+
+            # ── Sheet 2: Regressions ──────────────────────────────────────────
+            try:
+                reg_df = scraper.run_wsj_regressions(df)
+                reg_df.to_excel(writer, index=False, sheet_name="Regressions")
+                reg_ws = writer.book["Regressions"]
+
+                header_fill = PatternFill("solid", fgColor="D9E1F2")
+                bold_font   = Font(bold=True)
+                for row in reg_ws.iter_rows():
+                    if row[0].value and str(row[0].value).startswith("Ask Yield"):
+                        for cell in row:
+                            cell.font = bold_font
+                            cell.fill = header_fill
+                for col in reg_ws.columns:
+                    max_len = max((len(str(c.value or "")) for c in col), default=8)
+                    reg_ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 40)
+            except Exception as reg_exc:
+                pass   # regression failure doesn't prevent saving the main data
+
+            # ── Sheet 3: Regression Charts ────────────────────────────────────
+            try:
+                chart_png = scraper.build_regression_chart_image(df)
+                if chart_png is not None:
+                    from openpyxl.drawing.image import Image as XLImage
+                    from openpyxl.styles import Font as XLFont
+                    import io
+                    chart_ws = writer.book.create_sheet("Regression Charts")
+                    chart_ws["A1"] = "Ask Yield Regression Plots"
+                    chart_ws["A1"].font = XLFont(bold=True, size=13)
+                    img = XLImage(io.BytesIO(chart_png))
+                    img.anchor = "A3"
+                    chart_ws.add_image(img)
+            except Exception:
+                pass   # chart failure doesn't prevent saving
 
     # ── Barchart scrape ────────────────────────────────────────────────────────
 
@@ -814,7 +880,15 @@ class TreasuryApp(Tk):
                          linewidth=1.2, label=col)
 
         self._ax.set_xlabel(x_col)
-        self._ax.set_title("WSJ Treasury Data")
+        ref = getattr(self, "_last_reference_date", "")
+        try:
+            delta_val = float(self.delta_var.get().strip())
+        except ValueError:
+            delta_val = 0.01
+        title = "WSJ Treasury Data"
+        if ref:
+            title += f"  |  Reference Date: {ref}  |  Delta: {delta_val} ({delta_val*100:.4g}%)"
+        self._ax.set_title(title, fontsize=9)
         self._ax.legend(fontsize=8, loc="best")
         self._ax.grid(True, linestyle="--", alpha=0.4)
 

@@ -1804,6 +1804,199 @@ def add_payment_columns(
 
 
 # ============================================================
+# WSJ BOND REGRESSIONS
+# ============================================================
+
+def run_wsj_regressions(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Run 4 OLS regressions on WSJ Treasury data.
+    Dependent variable : Asked Yield
+    Independent vars   : Macaulay Duration, Modified Duration,
+                         EF_DURATION, Simulated Return (one each)
+
+    Returns a tidy summary DataFrame with one block of rows per model,
+    suitable for writing directly to an Excel sheet.
+    """
+    try:
+        import statsmodels.formula.api as smf
+    except ImportError as e:
+        raise ImportError(
+            "statsmodels is required for regressions. "
+            "Run: pip install statsmodels"
+        ) from e
+
+    dep_var = "Asked_Yield"   # statsmodels formula-safe name (no spaces)
+    models = [
+        ("Macaulay Duration",  "MACAULAY_DURATION"),
+        ("Modified Duration",  "MODIFIED_DURATION"),
+        ("Effective Duration", "EF_DURATION"),
+        ("Simulated Return",   "Simulated_Return"),
+    ]
+
+    # Rename columns to formula-safe names for statsmodels
+    rename = {
+        "Asked Yield":       dep_var,
+        "MACAULAY DURATION": "MACAULAY_DURATION",
+        "MODIFIED DURATION": "MODIFIED_DURATION",
+        "EF_DURATION":       "EF_DURATION",
+        "Simulated Return":  "Simulated_Return",
+    }
+    reg_df = df.rename(columns=rename)
+
+    all_cols = [dep_var] + [v for _, v in models]
+    missing  = [c for c in all_cols if c not in reg_df.columns]
+    if missing:
+        raise ValueError(
+            f"Regression columns not found: {missing}. "
+            "Run scrape_treasuries + add_payment_columns first."
+        )
+
+    reg_df = reg_df[all_cols].dropna()
+
+    summary_rows: list[dict] = []
+
+    for label, indep_var in models:
+        formula = f"{dep_var} ~ {indep_var}"
+        fit     = smf.ols(formula, data=reg_df).fit()
+
+        # Header row for this model
+        summary_rows.append({
+            "Model":       f"Ask Yield ~ {label}",
+            "Metric":      "",
+            "Coefficient": "",
+            "Std Error":   "",
+            "t-stat":      "",
+            "p-value":     "",
+            "R-squared":   "",
+            "Adj R-sq":    "",
+            "Observations":"",
+        })
+
+        # Stats row
+        summary_rows.append({
+            "Model":        "",
+            "Metric":       "Model Stats",
+            "Coefficient":  "",
+            "Std Error":    "",
+            "t-stat":       "",
+            "p-value":      "",
+            "R-squared":    round(float(fit.rsquared),     6),
+            "Adj R-sq":     round(float(fit.rsquared_adj), 6),
+            "Observations": int(fit.nobs),
+        })
+
+        # One row per coefficient (Intercept + slope)
+        for param in fit.params.index:
+            display = "Intercept" if param == "Intercept" else label
+            summary_rows.append({
+                "Model":        "",
+                "Metric":       display,
+                "Coefficient":  round(float(fit.params[param]),   6),
+                "Std Error":    round(float(fit.bse[param]),      6),
+                "t-stat":       round(float(fit.tvalues[param]),  4),
+                "p-value":      round(float(fit.pvalues[param]),  6),
+                "R-squared":    "",
+                "Adj R-sq":     "",
+                "Observations": "",
+            })
+
+        # Blank separator row
+        summary_rows.append({k: "" for k in summary_rows[0]})
+
+    return pd.DataFrame(summary_rows)
+
+
+def build_regression_chart_image(df: pd.DataFrame) -> Optional[bytes]:
+    """
+    Build a 2×2 grid of scatter + regression line plots.
+    One subplot per model: Asked Yield vs each of
+      Macaulay Duration, Modified Duration, EF_DURATION, Simulated Return.
+    Returns the chart as PNG bytes, or None if matplotlib is unavailable.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")   # non-interactive backend (no window)
+        import matplotlib.pyplot as plt
+        import matplotlib.gridspec as gridspec
+        import numpy as np
+        import io
+    except ImportError:
+        return None
+
+    rename = {
+        "Asked Yield":       "Asked Yield",
+        "MACAULAY DURATION": "MACAULAY DURATION",
+        "MODIFIED DURATION": "MODIFIED DURATION",
+        "EF_DURATION":       "EF_DURATION",
+        "Simulated Return":  "Simulated Return",
+    }
+    plot_df = df.rename(columns=rename)
+
+    models = [
+        ("Macaulay Duration",  "MACAULAY DURATION"),
+        ("Modified Duration",  "MODIFIED DURATION"),
+        ("Effective Duration", "EF_DURATION"),
+        ("Simulated Return",   "Simulated Return"),
+    ]
+
+    fig = plt.figure(figsize=(14, 10))
+    fig.suptitle("Ask Yield Regressions", fontsize=15, fontweight="bold", y=0.98)
+    gs  = gridspec.GridSpec(2, 2, figure=fig, hspace=0.45, wspace=0.35)
+
+    colors = ["#2196F3", "#4CAF50", "#FF9800", "#E91E63"]
+
+    for idx, (label, col) in enumerate(models):
+        ax = fig.add_subplot(gs[idx // 2, idx % 2])
+
+        sub = plot_df[["Asked Yield", col]].dropna()
+        if sub.empty or col not in sub.columns:
+            ax.set_title(f"Ask Yield ~ {label}\n(no data)", fontsize=10)
+            continue
+
+        x = sub[col].values.astype(float)
+        y = sub["Asked Yield"].values.astype(float)
+
+        # Scatter
+        ax.scatter(x, y, color=colors[idx], alpha=0.65, s=40, zorder=3,
+                   edgecolors="white", linewidth=0.5)
+
+        # Regression line
+        if len(x) >= 2:
+            m, b   = np.polyfit(x, y, 1)
+            x_line = np.linspace(x.min(), x.max(), 200)
+            ax.plot(x_line, m * x_line + b, color=colors[idx],
+                    linewidth=2, zorder=4)
+
+            # R²
+            y_hat = m * x + b
+            ss_res = np.sum((y - y_hat) ** 2)
+            ss_tot = np.sum((y - y.mean()) ** 2)
+            r2 = 1 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+
+            # Equation + R² annotation
+            sign  = "+" if b >= 0 else "-"
+            eq    = f"y = {m:.4f}x {sign} {abs(b):.4f}"
+            r2txt = f"R² = {r2:.4f}"
+            ax.text(0.05, 0.93, eq,    transform=ax.transAxes, fontsize=8,
+                    color="black", verticalalignment="top")
+            ax.text(0.05, 0.82, r2txt, transform=ax.transAxes, fontsize=9,
+                    color=colors[idx], fontweight="bold", verticalalignment="top")
+
+        ax.set_title(f"Ask Yield  ~  {label}", fontsize=10, fontweight="bold", pad=6)
+        ax.set_xlabel(label, fontsize=8)
+        ax.set_ylabel("Ask Yield (%)", fontsize=8)
+        ax.tick_params(labelsize=7)
+        ax.grid(True, linestyle="--", alpha=0.35, zorder=0)
+        ax.set_axisbelow(True)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
@@ -1858,26 +2051,84 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     df = add_payment_columns(df, reference_date, delta=args.delta)
 
     delta_pct = args.delta * 100
-    formula_rows = 14
+    # Row layout:
+    #   Row 1  → Date header (reference date or today)
+    #   Row 2  → blank separator
+    #   Rows 3–16 → formula legend (14 rows)
+    #   Row 17+   → data header + rows
+    DATE_ROW    = 1
+    FORMULA_ROW = 3
+    formula_rows = 16    # data starts after row 16 (0-indexed = startrow=16)
     sheet_name = "Treasuries"
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name=sheet_name, startrow=formula_rows)
         ws = writer.book[sheet_name]
-        ws["A1"]  = "Treasury Formulas"
-        ws["A2"]  = "Coupon Payment";    ws["B2"]  = "Coupon/2*1000"
-        ws["A3"]  = "PV0";               ws["B3"]  = "PV(Ask Yield/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
-        ws["A4"]  = "PV1";               ws["B4"]  = f"PV((Ask Yield+{delta_pct}%)/2, Number of Payments Until Maturity-2, Coupon Payment, 1000)"
-        ws["A5"]  = "P0";                ws["B5"]  = "PV0 * (1+Asked Yield/2)^(Days Since Last Payment/182)"
-        ws["A6"]  = "P1";                ws["B6"]  = f"PV1 * (1+(Asked Yield+{delta_pct}%)/2)^(Days Since Last Payment/182)"
-        ws["A7"]  = "Simulated Return";  ws["B7"]  = "(P1- P0 + Coupon*10)/P0"
-        ws["A8"]  = "MACAULAY DURATION"; ws["B8"]  = "DURATION(Current Date, Maturity Date, Coupon Rate, Ask Yield, 2)"
-        ws["A9"]  = "MODIFIED DURATION"; ws["B9"]  = "MDURATION(Current Date, Maturity Date, Coupon Rate, Ask Yield, 2)"
-        ws["A10"] = "PVUP";              ws["B10"] = f"PV(Ask Yield+{delta_pct}%/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
-        ws["A11"] = "PVDN";              ws["B11"] = f"PV(Ask Yield-{delta_pct}%/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
-        ws["A12"] = "PUP";               ws["B12"] = f"PVUP * (1+(Asked Yield+{delta_pct}%)/2)^(Days Since Last Payment/182)"
-        ws["A13"] = "PDN";               ws["B13"] = f"PVDN * (1+(Asked Yield-{delta_pct}%)/2)^(Days Since Last Payment/182)"
-        ws["A14"] = "EFDURATION";        ws["B14"] = f"(PDN- PUP)/(2*{args.delta}*P0)"
+
+        from openpyxl.styles import Font, PatternFill, Alignment
+        from datetime import date as _date
+
+        # ── Row 1: Date header ────────────────────────────────────────────────
+        display_date = reference_date.strftime("%B %d, %Y")
+        date_label   = f"Reference Date: {display_date}"
+        ws["A1"] = date_label
+        ws["A1"].font      = Font(bold=True, size=13, color="FFFFFF")
+        ws["A1"].fill      = PatternFill("solid", fgColor="1F4E79")
+        ws["A1"].alignment = Alignment(horizontal="left", vertical="center")
+        ws.row_dimensions[1].height = 22
+
+        # ── Rows 3–16: Formula legend ─────────────────────────────────────────
+        ws["A3"]  = "Treasury Formulas"
+        ws["A3"].font = Font(bold=True)
+        ws["A4"]  = "Coupon Payment";    ws["B4"]  = "Coupon/2*1000"
+        ws["A5"]  = "PV0";               ws["B5"]  = "PV(Ask Yield/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
+        ws["A6"]  = "PV1";               ws["B6"]  = f"PV((Ask Yield+{delta_pct}%)/2, Number of Payments Until Maturity-2, Coupon Payment, 1000)"
+        ws["A7"]  = "P0";                ws["B7"]  = "PV0 * (1+Asked Yield/2)^(Days Since Last Payment/182)"
+        ws["A8"]  = "P1";                ws["B8"]  = f"PV1 * (1+(Asked Yield+{delta_pct}%)/2)^(Days Since Last Payment/182)"
+        ws["A9"]  = "Simulated Return";  ws["B9"]  = "(P1- P0 + Coupon*10)/P0"
+        ws["A10"] = "MACAULAY DURATION"; ws["B10"] = "DURATION(Current Date, Maturity Date, Coupon Rate, Ask Yield, 2)"
+        ws["A11"] = "MODIFIED DURATION"; ws["B11"] = "MDURATION(Current Date, Maturity Date, Coupon Rate, Ask Yield, 2)"
+        ws["A12"] = "PVUP";              ws["B12"] = f"PV(Ask Yield+{delta_pct}%/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
+        ws["A13"] = "PVDN";              ws["B13"] = f"PV(Ask Yield-{delta_pct}%/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
+        ws["A14"] = "PUP";               ws["B14"] = f"PVUP * (1+(Asked Yield+{delta_pct}%)/2)^(Days Since Last Payment/182)"
+        ws["A15"] = "PDN";               ws["B15"] = f"PVDN * (1+(Asked Yield-{delta_pct}%)/2)^(Days Since Last Payment/182)"
+        ws["A16"] = "EFDURATION";        ws["B16"] = f"(PDN- PUP)/(2*{args.delta}*P0)"
+
+        # ── Sheet 2: Regressions ──────────────────────────────────────────────
+        try:
+            reg_summary = run_wsj_regressions(df)
+            reg_summary.to_excel(writer, index=False, sheet_name="Regressions")
+            reg_ws = writer.book["Regressions"]
+
+            # Bold the model header rows (col A non-empty)
+            from openpyxl.styles import Font, PatternFill, Alignment
+            header_fill  = PatternFill("solid", fgColor="D9E1F2")
+            bold_font    = Font(bold=True)
+            for row in reg_ws.iter_rows():
+                if row[0].value and str(row[0].value).startswith("Ask Yield"):
+                    for cell in row:
+                        cell.font = bold_font
+                        cell.fill = header_fill
+            # Auto-fit column widths
+            for col in reg_ws.columns:
+                max_len = max((len(str(c.value or "")) for c in col), default=8)
+                reg_ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 40)
+            print("  Regression sheet written.")
+
+            # ── Sheet 3: Regression Charts ────────────────────────────────────
+            chart_png = build_regression_chart_image(df)
+            if chart_png is not None:
+                from openpyxl.drawing.image import Image as XLImage
+                import io
+                chart_ws = writer.book.create_sheet("Regression Charts")
+                chart_ws["A1"] = "Ask Yield Regression Plots"
+                chart_ws["A1"].font = Font(bold=True, size=13)
+                img = XLImage(io.BytesIO(chart_png))
+                img.anchor = "A3"
+                chart_ws.add_image(img)
+                print("  Regression chart sheet written.")
+        except Exception as reg_exc:
+            print(f"  Warning: could not write regression sheet — {reg_exc}")
 
     print(f"Saved {len(df)} rows to {output_path.resolve()}")
     print(f"Reference date used: {reference_date.isoformat()}")
