@@ -2072,10 +2072,12 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         display_date = reference_date.strftime("%B %d, %Y")
         date_label   = f"Reference Date: {display_date}"
         ws["A1"] = date_label
-        ws["A1"].font      = Font(bold=True, size=13, color="FFFFFF")
+        ws.merge_cells("A1:J1")   # merge across 10 columns so text is always fully visible
+        ws["A1"].font      = Font(bold=True, size=16, color="FFFFFF")
         ws["A1"].fill      = PatternFill("solid", fgColor="1F4E79")
-        ws["A1"].alignment = Alignment(horizontal="left", vertical="center")
-        ws.row_dimensions[1].height = 22
+        ws["A1"].alignment = Alignment(horizontal="left", vertical="center",
+                                       indent=1, wrap_text=False)
+        ws.row_dimensions[1].height = 30   # taller row so 16pt text isn't clipped
 
         # ── Rows 3–16: Formula legend ─────────────────────────────────────────
         ws["A3"]  = "Treasury Formulas"

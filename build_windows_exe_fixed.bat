@@ -23,23 +23,14 @@ echo.
 if exist "dist\WSJ_Treasury_GUI\WSJ_Treasury_GUI.exe" (
     echo ================================================
     echo   Build complete!
-    echo.
-    echo   Your app folder:
-    echo   dist\WSJ_Treasury_GUI\
-    echo.
-    echo   Send the entire dist\WSJ_Treasury_GUI\ folder
-    echo   to anyone - they just double-click the .exe
-    echo   No Python needed on their machine.
-    echo.
-    echo   NOTE: First Barchart scrape on a new machine
-    echo   will auto-install Chromium ^(~150 MB, once only^).
+    echo   Your app folder:  dist\WSJ_Treasury_GUI\
+    echo   Send the whole folder - just double-click the .exe
+    echo   No Python needed on the target machine.
     echo ================================================
     explorer "dist\WSJ_Treasury_GUI"
 ) else (
     echo ================================================
-    echo   ERROR: EXE not found at expected location:
-    echo   dist\WSJ_Treasury_GUI\WSJ_Treasury_GUI.exe
-    echo.
+    echo   ERROR: EXE not found.
     echo   Check the output above for errors.
     echo ================================================
 )
