@@ -599,47 +599,51 @@ class TreasuryApp(Tk):
         from openpyxl.styles import Font, PatternFill, Alignment
         from datetime import date as _date
 
-        # Row 1: date header, Row 2: blank, Rows 3-16: formula legend, Row 17+: data
-        formula_rows = 16
+        # Row 1: WSJ date, Row 2: Delta, Row 3: blank, Rows 4-17: formula legend, Row 18+: data
+        formula_rows = 17
         sheet_name   = "Treasuries"
 
-        # Determine display date
-        if reference_date is not None:
-            display_date = reference_date.strftime("%B %d, %Y")
-            date_label   = f"Reference Date: {display_date}"
-        else:
-            display_date = _date.today().strftime("%B %d, %Y")
-            date_label   = f"Date: {display_date}"
+        # Always use the WSJ reference date — never fall back to today
+        display_date = reference_date.strftime("%B %d, %Y") if reference_date else "Unknown"
 
         with scraper.pd.ExcelWriter(output, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name=sheet_name, startrow=formula_rows)
             ws = writer.book[sheet_name]
 
-            # ── Row 1: Date header ────────────────────────────────────────────
-            ws["A1"] = date_label
-            ws.merge_cells("A1:J1")   # merge across 10 columns so text is always fully visible
+            # ── Row 1: WSJ date header ────────────────────────────────────────
+            ws["A1"] = f"WSJ Reference Date: {display_date}"
+            ws.merge_cells("A1:J1")
             ws["A1"].font      = Font(bold=True, size=16, color="FFFFFF")
             ws["A1"].fill      = PatternFill("solid", fgColor="1F4E79")
             ws["A1"].alignment = Alignment(horizontal="left", vertical="center",
                                            indent=1, wrap_text=False)
-            ws.row_dimensions[1].height = 30   # taller row so 16pt text isn't clipped
+            ws.row_dimensions[1].height = 30
 
-            # ── Rows 3–16: Formula legend ─────────────────────────────────────
-            ws["A3"]  = "Treasury Formulas"
-            ws["A3"].font = Font(bold=True)
-            ws["A4"]  = "Coupon Payment";    ws["B4"]  = "Coupon/2*1000"
-            ws["A5"]  = "PV0";               ws["B5"]  = "PV(Ask Yield/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
-            ws["A6"]  = "PV1";               ws["B6"]  = f"PV((Ask Yield+{delta_pct:.4g}%)/2, Number of Payments Until Maturity-2, Coupon Payment, 1000)"
-            ws["A7"]  = "P0";                ws["B7"]  = "PV0 * (1+Asked Yield/2)^(Days Since Last Payment/182)"
-            ws["A8"]  = "P1";                ws["B8"]  = f"PV1 * (1+(Asked Yield+{delta_pct:.4g}%)/2)^(Days Since Last Payment/182)"
-            ws["A9"]  = "Simulated Return";  ws["B9"]  = "(P1- P0 + Coupon*10)/P0"
-            ws["A10"] = "MACAULAY DURATION"; ws["B10"] = "DURATION(Current Date, Maturity Date, Coupon Rate, Ask Yield, 2)"
-            ws["A11"] = "MODIFIED DURATION"; ws["B11"] = "MDURATION(Current Date, Maturity Date, Coupon Rate, Ask Yield, 2)"
-            ws["A12"] = "PVUP";              ws["B12"] = f"PV(Ask Yield+{delta_pct:.4g}%/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
-            ws["A13"] = "PVDN";              ws["B13"] = f"PV(Ask Yield-{delta_pct:.4g}%/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
-            ws["A14"] = "PUP";               ws["B14"] = f"PVUP * (1+(Asked Yield+{delta_pct:.4g}%)/2)^(Days Since Last Payment/182)"
-            ws["A15"] = "PDN";               ws["B15"] = f"PVDN * (1+(Asked Yield-{delta_pct:.4g}%)/2)^(Days Since Last Payment/182)"
-            ws["A16"] = "EFDURATION";        ws["B16"] = f"(PDN- PUP)/(2*{delta}*P0)"
+            # ── Row 2: Delta ──────────────────────────────────────────────────
+            ws["A2"] = f"Delta: {delta}  ({delta_pct:.4g}% yield shift)"
+            ws.merge_cells("A2:J2")
+            ws["A2"].font      = Font(bold=True, size=11, color="FFFFFF")
+            ws["A2"].fill      = PatternFill("solid", fgColor="2E75B6")
+            ws["A2"].alignment = Alignment(horizontal="left", vertical="center",
+                                           indent=1, wrap_text=False)
+            ws.row_dimensions[2].height = 20
+
+            # ── Rows 4–17: Formula legend ─────────────────────────────────────
+            ws["A4"]  = "Treasury Formulas"
+            ws["A4"].font = Font(bold=True)
+            ws["A5"]  = "Coupon Payment";    ws["B5"]  = "Coupon/2*1000"
+            ws["A6"]  = "PV0";               ws["B6"]  = "PV(Ask Yield/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
+            ws["A7"]  = "PV1";               ws["B7"]  = f"PV((Ask Yield+{delta_pct:.4g}%)/2, Number of Payments Until Maturity-2, Coupon Payment, 1000)"
+            ws["A8"]  = "P0";                ws["B8"]  = "PV0 * (1+Asked Yield/2)^(Days Since Last Payment/182)"
+            ws["A9"]  = "P1";                ws["B9"]  = f"PV1 * (1+(Asked Yield+{delta_pct:.4g}%)/2)^(Days Since Last Payment/182)"
+            ws["A10"] = "Simulated Return";  ws["B10"] = "(P1- P0 + Coupon*10)/P0"
+            ws["A11"] = "MACAULAY DURATION"; ws["B11"] = "DURATION(Current Date, Maturity Date, Coupon Rate, Ask Yield, 2)"
+            ws["A12"] = "MODIFIED DURATION"; ws["B12"] = "MDURATION(Current Date, Maturity Date, Coupon Rate, Ask Yield, 2)"
+            ws["A13"] = "PVUP";              ws["B13"] = f"PV(Ask Yield+{delta_pct:.4g}%/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
+            ws["A14"] = "PVDN";              ws["B14"] = f"PV(Ask Yield-{delta_pct:.4g}%/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
+            ws["A15"] = "PUP";               ws["B15"] = f"PVUP * (1+(Asked Yield+{delta_pct:.4g}%)/2)^(Days Since Last Payment/182)"
+            ws["A16"] = "PDN";               ws["B16"] = f"PVDN * (1+(Asked Yield-{delta_pct:.4g}%)/2)^(Days Since Last Payment/182)"
+            ws["A17"] = "EFDURATION";        ws["B17"] = f"(PDN- PUP)/(2*{delta}*P0)"
 
             # ── Sheet 2: Regressions ──────────────────────────────────────────
             try:

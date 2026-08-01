@@ -265,6 +265,9 @@ def first_regex_match(patterns: Sequence[str], text: str) -> Optional[str]:
 
 def parse_reference_date_from_html(html: str) -> Optional[date]:
     patterns = [
+        # WSJ treasury page: <span class="WSJBase--card__timestamp--...">Friday, July 31, 2026</span>
+        r'<span[^>]*WSJBase--card__timestamp[^>]*>([^<]+)</span>',
+        # Standard meta tags
         r'<meta[^>]+property=["\']article:published_time["\'][^>]+content=["\']([^"\']+)["\']',
         r'<meta[^>]+name=["\']article:published_time["\'][^>]+content=["\']([^"\']+)["\']',
         r'<meta[^>]+property=["\']article:modified_time["\'][^>]+content=["\']([^"\']+)["\']',
@@ -277,10 +280,16 @@ def parse_reference_date_from_html(html: str) -> Optional[date]:
         r"\bPublished\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})\b",
         r"\bUpdated\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})\b",
         r"\bAs of\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})\b",
+        # Day-of-week + Month date fallback e.g. "Friday, July 31, 2026"
+        r"\b(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})\b",
     ]
 
     raw = first_regex_match(patterns, html)
-    return parse_date_string(raw) if raw else None
+    if raw:
+        # Strip leading day-of-week if present (e.g. "Friday, July 31, 2026" → "July 31, 2026")
+        raw = re.sub(r'^(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),\s*', '', raw.strip())
+        return parse_date_string(raw)
+    return None
 
 
 def get_reference_date(url: str, explicit_reference_date: Optional[str] = None) -> date:
@@ -319,6 +328,10 @@ def get_reference_date(url: str, explicit_reference_date: Optional[str] = None) 
             page.wait_for_timeout(5000)
 
             for selector in [
+                # WSJ treasury timestamp span (highest priority)
+                "[class*='WSJBase--card__timestamp']",
+                "[class*='card__timestamp']",
+                # Standard meta tags
                 "meta[property='article:published_time']",
                 "meta[name='article:published_time']",
                 "meta[property='article:modified_time']",
@@ -328,8 +341,18 @@ def get_reference_date(url: str, explicit_reference_date: Optional[str] = None) 
             ]:
                 loc = page.locator(selector)
                 if loc.count() > 0:
-                    content = loc.first.get_attribute("content")
-                    parsed = parse_date_string(content) if content else None
+                    # Span elements: read inner text; meta elements: read content attribute
+                    if selector.startswith("[class"):
+                        raw_text = loc.first.inner_text().strip()
+                        # Strip leading day-of-week e.g. "Friday, July 31, 2026"
+                        raw_text = re.sub(
+                            r'^(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),\s*',
+                            '', raw_text
+                        )
+                        parsed = parse_date_string(raw_text) if raw_text else None
+                    else:
+                        content = loc.first.get_attribute("content")
+                        parsed = parse_date_string(content) if content else None
                     if parsed is not None:
                         browser.close()
                         return parsed
@@ -1716,7 +1739,6 @@ def add_payment_columns(
     # Asked Yield is stored as e.g. 4.31 (meaning 4.31%), so delta_pp = 0.007*100 = 0.7
     delta_pp = delta * 100.0
 
-    df["Delta"] = delta          # store the raw decimal value for reference
     df["Article Date"] = reference_date
 
     df["Previous Payment Date"] = df["Maturity"].apply(
@@ -2058,7 +2080,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     #   Row 17+   → data header + rows
     DATE_ROW    = 1
     FORMULA_ROW = 3
-    formula_rows = 16    # data starts after row 16 (0-indexed = startrow=16)
+    formula_rows = 17    # data starts after row 17 (0-indexed = startrow=17)
     sheet_name = "Treasuries"
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
@@ -2068,33 +2090,41 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         from openpyxl.styles import Font, PatternFill, Alignment
         from datetime import date as _date
 
-        # ── Row 1: Date header ────────────────────────────────────────────────
+        # ── Row 1: WSJ date header ────────────────────────────────────────────
         display_date = reference_date.strftime("%B %d, %Y")
-        date_label   = f"Reference Date: {display_date}"
-        ws["A1"] = date_label
-        ws.merge_cells("A1:J1")   # merge across 10 columns so text is always fully visible
+        ws["A1"] = f"WSJ Reference Date: {display_date}"
+        ws.merge_cells("A1:J1")
         ws["A1"].font      = Font(bold=True, size=16, color="FFFFFF")
         ws["A1"].fill      = PatternFill("solid", fgColor="1F4E79")
         ws["A1"].alignment = Alignment(horizontal="left", vertical="center",
                                        indent=1, wrap_text=False)
-        ws.row_dimensions[1].height = 30   # taller row so 16pt text isn't clipped
+        ws.row_dimensions[1].height = 30
 
-        # ── Rows 3–16: Formula legend ─────────────────────────────────────────
-        ws["A3"]  = "Treasury Formulas"
-        ws["A3"].font = Font(bold=True)
-        ws["A4"]  = "Coupon Payment";    ws["B4"]  = "Coupon/2*1000"
-        ws["A5"]  = "PV0";               ws["B5"]  = "PV(Ask Yield/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
-        ws["A6"]  = "PV1";               ws["B6"]  = f"PV((Ask Yield+{delta_pct}%)/2, Number of Payments Until Maturity-2, Coupon Payment, 1000)"
-        ws["A7"]  = "P0";                ws["B7"]  = "PV0 * (1+Asked Yield/2)^(Days Since Last Payment/182)"
-        ws["A8"]  = "P1";                ws["B8"]  = f"PV1 * (1+(Asked Yield+{delta_pct}%)/2)^(Days Since Last Payment/182)"
-        ws["A9"]  = "Simulated Return";  ws["B9"]  = "(P1- P0 + Coupon*10)/P0"
-        ws["A10"] = "MACAULAY DURATION"; ws["B10"] = "DURATION(Current Date, Maturity Date, Coupon Rate, Ask Yield, 2)"
-        ws["A11"] = "MODIFIED DURATION"; ws["B11"] = "MDURATION(Current Date, Maturity Date, Coupon Rate, Ask Yield, 2)"
-        ws["A12"] = "PVUP";              ws["B12"] = f"PV(Ask Yield+{delta_pct}%/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
-        ws["A13"] = "PVDN";              ws["B13"] = f"PV(Ask Yield-{delta_pct}%/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
-        ws["A14"] = "PUP";               ws["B14"] = f"PVUP * (1+(Asked Yield+{delta_pct}%)/2)^(Days Since Last Payment/182)"
-        ws["A15"] = "PDN";               ws["B15"] = f"PVDN * (1+(Asked Yield-{delta_pct}%)/2)^(Days Since Last Payment/182)"
-        ws["A16"] = "EFDURATION";        ws["B16"] = f"(PDN- PUP)/(2*{args.delta}*P0)"
+        # ── Row 2: Delta ──────────────────────────────────────────────────────
+        ws["A2"] = f"Delta: {args.delta}  ({delta_pct:.4g}% yield shift)"
+        ws.merge_cells("A2:J2")
+        ws["A2"].font      = Font(bold=True, size=11, color="FFFFFF")
+        ws["A2"].fill      = PatternFill("solid", fgColor="2E75B6")
+        ws["A2"].alignment = Alignment(horizontal="left", vertical="center",
+                                       indent=1, wrap_text=False)
+        ws.row_dimensions[2].height = 20
+
+        # ── Rows 4–17: Formula legend ─────────────────────────────────────────
+        ws["A4"]  = "Treasury Formulas"
+        ws["A4"].font = Font(bold=True)
+        ws["A5"]  = "Coupon Payment";    ws["B5"]  = "Coupon/2*1000"
+        ws["A6"]  = "PV0";               ws["B6"]  = "PV(Ask Yield/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
+        ws["A7"]  = "PV1";               ws["B7"]  = f"PV((Ask Yield+{delta_pct}%)/2, Number of Payments Until Maturity-2, Coupon Payment, 1000)"
+        ws["A8"]  = "P0";                ws["B8"]  = "PV0 * (1+Asked Yield/2)^(Days Since Last Payment/182)"
+        ws["A9"]  = "P1";                ws["B9"]  = f"PV1 * (1+(Asked Yield+{delta_pct}%)/2)^(Days Since Last Payment/182)"
+        ws["A10"] = "Simulated Return";  ws["B10"] = "(P1- P0 + Coupon*10)/P0"
+        ws["A11"] = "MACAULAY DURATION"; ws["B11"] = "DURATION(Current Date, Maturity Date, Coupon Rate, Ask Yield, 2)"
+        ws["A12"] = "MODIFIED DURATION"; ws["B12"] = "MDURATION(Current Date, Maturity Date, Coupon Rate, Ask Yield, 2)"
+        ws["A13"] = "PVUP";              ws["B13"] = f"PV(Ask Yield+{delta_pct}%/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
+        ws["A14"] = "PVDN";              ws["B14"] = f"PV(Ask Yield-{delta_pct}%/2, Number of Payments Until Maturity, Coupon Payment, 1000)"
+        ws["A15"] = "PUP";               ws["B15"] = f"PVUP * (1+(Asked Yield+{delta_pct}%)/2)^(Days Since Last Payment/182)"
+        ws["A16"] = "PDN";               ws["B16"] = f"PVDN * (1+(Asked Yield-{delta_pct}%)/2)^(Days Since Last Payment/182)"
+        ws["A17"] = "EFDURATION";        ws["B17"] = f"(PDN- PUP)/(2*{args.delta}*P0)"
 
         # ── Sheet 2: Regressions ──────────────────────────────────────────────
         try:
