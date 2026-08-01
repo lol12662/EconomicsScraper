@@ -39,6 +39,12 @@ DEFAULT_URL = "https://www.wsj.com/market-data/bonds/treasuries#treasuryB"
 BARCHART_URL = "https://www.barchart.com/futures/financials?viewName=main"
 TARGET_COLUMNS = ["Maturity", "Coupon", "Asked Yield"]
 
+# ── Change this value to set the default Delta ────────────────────────────────
+# Delta is the yield shift used for PV1, P1, PVUP, PVDN, and EF_DURATION.
+# Expressed as a decimal fraction:  0.01 = 1%,  0.007 = 0.7%,  0.005 = 0.5%
+DEFAULT_DELTA: float = 0.05
+# ─────────────────────────────────────────────────────────────────────────────
+
 # Barchart futures columns
 BARCHART_COLUMNS = ["Symbol", "Contract Name", "Latest", "Change", "Volume", "Time"]
 
@@ -1721,7 +1727,7 @@ def modified_duration(
 def add_payment_columns(
     df: pd.DataFrame,
     reference_date: date,
-    delta: float = 0.01,
+    delta: float = DEFAULT_DELTA,
 ) -> pd.DataFrame:
     """Compute bond analytics columns.
 
@@ -2040,10 +2046,11 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     parser.add_argument(
         "--delta",
         type=float,
-        default=0.01,
+        default=DEFAULT_DELTA,
         help=(
-            "(WSJ only) Yield shift for PV1, P1, PVUP, PVDN, EF_DURATION. "
-            "Expressed as a decimal fraction: 0.01 = 1%% (default), 0.007 = 0.7%%."
+            f"(WSJ only) Yield shift for PV1, P1, PVUP, PVDN, EF_DURATION. "
+            f"Expressed as a decimal fraction: 0.01 = 1%%, 0.007 = 0.7%%. "
+            f"Current default: {DEFAULT_DELTA} ({DEFAULT_DELTA*100:.4g}%%)."
         ),
     )
     args = parser.parse_args(list(argv) if argv is not None else None)
